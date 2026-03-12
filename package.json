@@ -1,0 +1,45 @@
+{
+  "name": "muuuuse",
+  "version": "0.2.0",
+  "description": "🔌Muuuuse links two local tmux terminals through a third control seat so Codex, Claude, Gemini, or scripts can bounce final answers forever.",
+  "type": "commonjs",
+  "bin": {
+    "muuuuse": "bin/muuse.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "homepage": "https://muuuuse.lmtlssss.fun",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lmtlssss/muuuuse.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lmtlssss/muuuuse/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "keywords": [
+    "terminal",
+    "ai",
+    "tmux",
+    "relay",
+    "local",
+    "codex",
+    "claude",
+    "gemini"
+  ],
+  "scripts": {
+    "test": "node test/cli.test.js",
+    "pack:local": "npm pack",
+    "prepublishOnly": "npm test"
+  }
+}
