@@ -1,6 +1,6 @@
 {
   "name": "muuuuse",
-  "version": "0.3.0",
+  "version": "1.3.0",
   "description": "🔌Muuuuse wraps two local programs and bounces final blocks between them from the terminal you launched.",
   "type": "commonjs",
   "bin": {
