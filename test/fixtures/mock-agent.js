@@ -11,6 +11,7 @@ const startedAt = new Date().toISOString();
 const cwd = process.cwd();
 const replyMode = String(process.env.MOCK_REPLY_MODE || "prefix").trim().toLowerCase();
 const forcedReplyText = decodeMockText(String(process.env.MOCK_REPLY_TEXT || "").trim());
+const replyDelayMs = Math.max(0, Number.parseInt(process.env.MOCK_REPLY_DELAY_MS || "120", 10) || 120);
 const replySequence = String(process.env.MOCK_REPLY_SEQUENCE || "")
   .split("|")
   .map((value) => decodeMockText(value.trim()))
@@ -38,7 +39,7 @@ rl.on("line", (line) => {
     setTimeout(() => {
       appendAnswer(agentType, sessionFile, reply);
       process.stdout.write(`${reply}\n`);
-    }, 120 * (index + 1));
+    }, replyDelayMs * (index + 1));
   });
 });
 

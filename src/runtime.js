@@ -35,7 +35,8 @@ const {
   writeJson,
 } = require("./util");
 
-const TYPE_DELAY_MS = 70;
+const TYPE_CHUNK_DELAY_MS = 18;
+const TYPE_CHUNK_SIZE = 24;
 const MIRROR_SUPPRESSION_WINDOW_MS = 30 * 1000;
 const PENDING_RELAY_CONTEXT_TTL_MS = 2 * 60 * 1000;
 const EMITTED_ANSWER_TTL_MS = 5 * 60 * 1000;
@@ -435,24 +436,57 @@ function readSeatChallenge(paths, sessionName) {
   };
 }
 
-async function sendTextAndEnter(child, text, shouldAbort = () => false) {
-  const payload = String(text || "")
+function normalizeRelayPayloadForTyping(text) {
+  return String(text || "")
     .replace(/\r/g, "")
     .replace(/\s*\n+\s*/g, " ")
     .replace(/[ \t]{2,}/g, " ")
     .trim();
+}
+
+function chunkRelayPayloadForTyping(text, chunkSize = TYPE_CHUNK_SIZE) {
+  const normalized = String(text || "");
+  if (!normalized) {
+    return [];
+  }
+
+  const size = Number.isInteger(chunkSize) && chunkSize > 0 ? chunkSize : TYPE_CHUNK_SIZE;
+  const chunks = [];
+  for (let index = 0; index < normalized.length; index += size) {
+    chunks.push(normalized.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function stripPassiveTerminalInput(input) {
+  return String(input || "")
+    .replace(/\u001b\][\s\S]*?(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001b\[(?:I|O)/g, "")
+    .replace(/\u001b\[\d+;\d+R/g, "")
+    .replace(/\u001b\[\?[0-9;]*c/g, "")
+    .replace(/\u0000/g, "");
+}
+
+function isMeaningfulTerminalInput(input) {
+  return stripPassiveTerminalInput(input).length > 0;
+}
+
+async function sendTextAndEnter(child, text, shouldAbort = () => false) {
+  const payload = normalizeRelayPayloadForTyping(text);
 
   if (payload.length > 0) {
-    if (shouldAbort() || !child) {
-      return false;
-    }
+    for (const chunk of chunkRelayPayloadForTyping(payload)) {
+      if (shouldAbort() || !child) {
+        return false;
+      }
 
-    try {
-      child.write(payload);
-    } catch {
-      return false;
+      try {
+        child.write(chunk);
+      } catch {
+        return false;
+      }
+      await sleep(TYPE_CHUNK_DELAY_MS);
     }
-    await sleep(TYPE_DELAY_MS);
   }
 
   if (shouldAbort() || !child) {
@@ -772,12 +806,15 @@ class ArmedSeat {
 
   installStdinProxy() {
     const handleData = (chunk) => {
-      this.lastUserInputAtMs = Date.now();
-      this.pendingInboundContext = null;
+      const chunkText = chunk.toString("utf8");
+      if (isMeaningfulTerminalInput(chunkText)) {
+        this.lastUserInputAtMs = Date.now();
+        this.pendingInboundContext = null;
+      }
       if (!this.child) {
         return;
       }
-      this.child.write(chunk.toString("utf8"));
+      this.child.write(chunkText);
     };
 
     const handleEnd = () => {
@@ -1475,7 +1512,10 @@ function stopAllSessions() {
 module.exports = {
   ArmedSeat,
   buildChildEnv,
+  chunkRelayPayloadForTyping,
   getStatusReport,
+  isMeaningfulTerminalInput,
+  normalizeRelayPayloadForTyping,
   resolveSessionName,
   stopAllSessions,
 };

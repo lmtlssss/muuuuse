@@ -18,7 +18,12 @@ const {
     selectCodexSessionFile,
     selectSessionCandidatePath,
 } = require("../src/agents");
-const { buildChildEnv } = require("../src/runtime");
+const {
+  buildChildEnv,
+  chunkRelayPayloadForTyping,
+  isMeaningfulTerminalInput,
+  normalizeRelayPayloadForTyping,
+} = require("../src/runtime");
 
 const binPath = path.join(__dirname, "..", "bin", "muuse.js");
 const fixturePath = path.join(__dirname, "fixtures", "mock-agent.js");
@@ -35,6 +40,8 @@ async function main() {
   testLateAttachFiltering();
   testSessionCandidateSelection();
   testChildEnvScrubsOuterCodexState();
+  testTerminalInputFiltering();
+  testRelayTypingChunks();
   testAgentDetection();
   testAgentDetectionPrefersShallowCodexWrapper();
   await testCodexPidBoundSessionSelection();
@@ -48,6 +55,7 @@ async function main() {
   await testAlternatingRepliesStopAfterSingleBounce();
   await testQueuedRepliesAfterInboundStaySuppressed();
   await testMultilineRelaySubmitsOnce();
+  await testPassiveTerminalReportsDoNotClearRelayContext();
   await testSeatSpecificFlowModes();
   await testStopSilencesBellLoop();
   process.stdout.write("muuuuse tests passed\n");
@@ -357,6 +365,29 @@ function testChildEnvScrubsOuterCodexState() {
   assert.equal(childEnv.PATH, ["/usr/local/bin", "/usr/bin"].join(path.delimiter));
 }
 
+function testTerminalInputFiltering() {
+  assert.equal(isMeaningfulTerminalInput("\u001b[I"), false);
+  assert.equal(isMeaningfulTerminalInput("\u001b[O"), false);
+  assert.equal(isMeaningfulTerminalInput("\u001b]10;rgb:ffff/ffff/ffff\u001b\\"), false);
+  assert.equal(isMeaningfulTerminalInput("\u001b]11;rgb:0000/0000/0000\u0007"), false);
+  assert.equal(isMeaningfulTerminalInput("\u001b[12;34R"), false);
+  assert.equal(isMeaningfulTerminalInput("\u001b[?1;2c"), false);
+  assert.equal(isMeaningfulTerminalInput("\u001b[A"), true);
+  assert.equal(isMeaningfulTerminalInput("\r"), true);
+  assert.equal(isMeaningfulTerminalInput("go"), true);
+}
+
+function testRelayTypingChunks() {
+  assert.equal(
+    normalizeRelayPayloadForTyping("  alpha \n\n beta \r\n gamma  "),
+    "alpha beta gamma"
+  );
+  assert.deepEqual(
+    chunkRelayPayloadForTyping("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 10),
+    ["ABCDEFGHIJ", "KLMNOPQRST", "UVWXYZ"]
+  );
+}
+
 function testAgentDetection() {
   const detected = detectAgent([
     { pid: 11, elapsedSeconds: 9, args: "python helper.py", cwd: "/tmp/demo" },
@@ -626,8 +657,8 @@ async function testDuplicateAnswerIdsAreDeduped() {
 
     seat1.write("go\r");
 
-    await seat1.waitFor(/(?:^|[\r\n])ONE(?:[\r\n]|$)/);
-    await seat2.waitFor(/(?:^|[\r\n])ONE(?:[\r\n]|$)/);
+    await seat1.waitFor(/\bONE\b/);
+    await seat2.waitFor(/\bONE\b/);
     await sleep(1200);
 
     const seat1Events = readAnswerEvents(home, sessionName, 1);
@@ -664,8 +695,8 @@ async function testMirrorRepliesDoNotPingPong() {
 
     seat1.write("yes\r");
 
-    await seat1.waitFor(/(?:^|[\r\n])yes(?:[\r\n]|$)/);
-    await seat2.waitFor(/(?:^|[\r\n])yes(?:[\r\n]|$)/);
+    await seat1.waitFor(/\byes\b/);
+    await seat2.waitFor(/\byes\b/);
     await sleep(1200);
 
     const seat1Events = readAnswerEvents(home, sessionName, 1);
@@ -721,10 +752,10 @@ async function testAlternatingRepliesStopAfterSingleBounce() {
 
     seat1.write("go\r");
 
-    await seat1.waitFor(/(?:^|[\r\n])ONE(?:[\r\n]|$)/);
-    await seat2.waitFor(/(?:^|[\r\n])ONE(?:[\r\n]|$)/);
-    await seat1.waitFor(/(?:^|[\r\n])TWO(?:[\r\n]|$)/);
-    await seat2.waitFor(/(?:^|[\r\n])TWO(?:[\r\n]|$)/);
+    await seat1.waitFor(/\bONE\b/);
+    await seat2.waitFor(/\bONE\b/);
+    await seat1.waitFor(/\bTWO\b/);
+    await seat2.waitFor(/\bTWO\b/);
     await sleep(1500);
 
     const seat1Events = readAnswerEvents(home, sessionName, 1);
@@ -761,9 +792,9 @@ async function testQueuedRepliesAfterInboundStaySuppressed() {
 
     seat1.write("go\r");
 
-    await seat1.waitFor(/(?:^|[\r\n])ONE(?:[\r\n]|$)/);
-    await seat2.waitFor(/(?:^|[\r\n])ONE(?:[\r\n]|$)/);
-    await seat1.waitFor(/(?:^|[\r\n])TWO(?:[\r\n]|$)/);
+    await seat1.waitFor(/\bONE\b/);
+    await seat2.waitFor(/\bONE\b/);
+    await seat1.waitFor(/\bTWO\b/);
     await sleep(1500);
 
     const seat1Events = readAnswerEvents(home, sessionName, 1);
@@ -810,6 +841,49 @@ async function testMultilineRelaySubmitsOnce() {
 
     assert.deepEqual(seat1Events.map((entry) => entry.text), ["ALPHA\nBETA"]);
     assert.deepEqual(seat2Events.map((entry) => entry.text), ["ALPHA BETA"]);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
+}
+
+async function testPassiveTerminalReportsDoNotClearRelayContext() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-passive-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-passive-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home });
+  const seat2 = spawnSeat(2, { cwd, home });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
+
+    seat1.write(`MOCK_REPLY_TEXT=ONE ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`MOCK_REPLY_TEXT=TWO MOCK_REPLY_DELAY_MS=900 ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+
+    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
+
+    seat1.write("go\r");
+
+    await seat1.waitFor(/\bONE\b/);
+    await sleep(300);
+    seat2.write("\u001b[I\u001b]10;rgb:ffff/ffff/ffff\u001b\\\u001b]11;rgb:0000/0000/0000\u001b\\\u001b[12;34R");
+
+    await seat2.waitFor(/\bTWO\b/);
+    await sleep(1200);
+
+    const seat1Events = readAnswerEvents(home, sessionName, 1);
+    const seat2Events = readAnswerEvents(home, sessionName, 2);
+
+    assert.deepEqual(seat1Events.map((entry) => entry.text), ["ONE"]);
+    assert.deepEqual(seat2Events.map((entry) => entry.text), ["TWO"]);
+    assert.equal(seat2Events[0].hop, 1);
+    assert.equal(seat2Events[0].chainId, seat1Events[0].id);
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();
