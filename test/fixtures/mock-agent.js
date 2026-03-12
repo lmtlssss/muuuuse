@@ -10,10 +10,10 @@ const agentType = String(process.argv[2] || "codex").trim().toLowerCase();
 const startedAt = new Date().toISOString();
 const cwd = process.cwd();
 const replyMode = String(process.env.MOCK_REPLY_MODE || "prefix").trim().toLowerCase();
-const forcedReplyText = String(process.env.MOCK_REPLY_TEXT || "").trim();
+const forcedReplyText = decodeMockText(String(process.env.MOCK_REPLY_TEXT || "").trim());
 const replySequence = String(process.env.MOCK_REPLY_SEQUENCE || "")
   .split("|")
-  .map((value) => value.trim())
+  .map((value) => decodeMockText(value.trim()))
   .filter(Boolean);
 let turn = 0;
 const keepaliveFds = [];
@@ -67,7 +67,14 @@ function resolveReplyToken(token, trimmed, currentTurn) {
     return `${agentType} turn ${currentTurn}: ${trimmed.slice(0, 120)}`;
   }
 
-  return token;
+  return decodeMockText(token);
+}
+
+function decodeMockText(value) {
+  return String(value || "")
+    .replace(/\\r/g, "\r")
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t");
 }
 
 function initializeSessionFile(type, currentPath, timestamp) {

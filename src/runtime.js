@@ -51,6 +51,10 @@ const CHILD_ENV_DROP_KEYS = [
   "CODEX_THREAD_ID",
 ];
 
+function normalizeFlowMode(flowMode) {
+  return String(flowMode || "").trim().toLowerCase() === "on" ? "on" : "off";
+}
+
 function resolveShell() {
   const shell = String(process.env.SHELL || "").trim();
   return shell || "/bin/bash";
@@ -212,6 +216,51 @@ function parseAnswerEntries(text) {
       }
     })
     .filter((entry) => entry && entry.type === "answer" && typeof entry.text === "string");
+}
+
+function readSessionHeaderText(filePath, maxBytes = 16384) {
+  try {
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const buffer = Buffer.alloc(maxBytes);
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+      return buffer.toString("utf8", 0, bytesRead);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
+}
+
+function readSessionFileStartedAtMs(agentType, filePath) {
+  try {
+    if (agentType === "gemini") {
+      const entry = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      return Date.parse(entry.startTime || entry.lastUpdated || "");
+    }
+
+    const header = readSessionHeaderText(filePath);
+    const lines = header
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    for (const line of lines) {
+      const entry = JSON.parse(line);
+      if (agentType === "codex" && entry?.type === "session_meta") {
+        return Date.parse(entry.payload?.timestamp || "");
+      }
+
+      if (agentType === "claude") {
+        return Date.parse(entry.timestamp || entry.message?.timestamp || "");
+      }
+    }
+  } catch {
+    return Number.NaN;
+  }
+
+  return Number.NaN;
 }
 
 function readProcessCwd(pid) {
@@ -387,35 +436,23 @@ function readSeatChallenge(paths, sessionName) {
 }
 
 async function sendTextAndEnter(child, text, shouldAbort = () => false) {
-  const lines = String(text || "").replace(/\r/g, "").split("\n");
+  const payload = String(text || "")
+    .replace(/\r/g, "")
+    .replace(/\s*\n+\s*/g, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
 
-  for (let index = 0; index < lines.length; index += 1) {
+  if (payload.length > 0) {
     if (shouldAbort() || !child) {
       return false;
     }
 
-    const line = lines[index];
-    if (line.length > 0) {
-      try {
-        child.write(line);
-      } catch {
-        return false;
-      }
-      await sleep(TYPE_DELAY_MS);
+    try {
+      child.write(payload);
+    } catch {
+      return false;
     }
-
-    if (index < lines.length - 1) {
-      if (shouldAbort()) {
-        return false;
-      }
-
-      try {
-        child.write("\r");
-      } catch {
-        return false;
-      }
-      await sleep(TYPE_DELAY_MS);
-    }
+    await sleep(TYPE_DELAY_MS);
   }
 
   if (shouldAbort() || !child) {
@@ -435,6 +472,7 @@ class ArmedSeat {
   constructor(options) {
     this.seatId = options.seatId;
     this.partnerSeatId = options.seatId === 1 ? 2 : 1;
+    this.flowMode = normalizeFlowMode(options.flowMode);
     this.cwd = normalizeWorkingPath(options.cwd);
     this.sessionName = resolveSessionName(this.cwd, this.seatId);
     if (!this.sessionName) {
@@ -503,6 +541,7 @@ class ArmedSeat {
       seatId: this.seatId,
       partnerSeatId: this.partnerSeatId,
       sessionName: this.sessionName,
+      flowMode: this.flowMode,
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
@@ -517,6 +556,7 @@ class ArmedSeat {
       seatId: this.seatId,
       partnerSeatId: this.partnerSeatId,
       sessionName: this.sessionName,
+      flowMode: this.flowMode,
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
@@ -1079,6 +1119,10 @@ class ArmedSeat {
       this.liveState.sessionFile = resolvedSessionFile;
       this.liveState.offset = 0;
       this.liveState.lastMessageId = null;
+      const sessionStartedAtMs = readSessionFileStartedAtMs(detectedAgent.type, resolvedSessionFile);
+      if (Number.isFinite(sessionStartedAtMs)) {
+        this.liveState.captureSinceMs = Math.min(this.liveState.captureSinceMs, sessionStartedAtMs);
+      }
     }
 
     if (!this.liveState.sessionFile) {
@@ -1096,7 +1140,8 @@ class ArmedSeat {
       const result = readCodexAnswers(
         this.liveState.sessionFile,
         this.liveState.offset,
-        this.liveState.captureSinceMs
+        this.liveState.captureSinceMs,
+        { flowMode: this.flowMode === "on" }
       );
       this.liveState.offset = result.nextOffset;
       answers.push(...result.answers);
@@ -1104,7 +1149,8 @@ class ArmedSeat {
       const result = readClaudeAnswers(
         this.liveState.sessionFile,
         this.liveState.offset,
-        this.liveState.captureSinceMs
+        this.liveState.captureSinceMs,
+        { flowMode: this.flowMode === "on" }
       );
       this.liveState.offset = result.nextOffset;
       answers.push(...result.answers);
@@ -1112,7 +1158,8 @@ class ArmedSeat {
       const result = readGeminiAnswers(
         this.liveState.sessionFile,
         this.liveState.lastMessageId,
-        this.liveState.captureSinceMs
+        this.liveState.captureSinceMs,
+        { flowMode: this.flowMode === "on" }
       );
       this.liveState.lastMessageId = result.lastMessageId;
       this.liveState.offset = result.fileSize;
@@ -1161,7 +1208,7 @@ class ArmedSeat {
     }
 
     const pendingInboundContext = this.getPendingInboundContext();
-    if (pendingInboundContext && pendingInboundContext.hop >= MAX_RELAY_CHAIN_HOP) {
+    if (this.flowMode !== "on" && pendingInboundContext && pendingInboundContext.hop >= MAX_RELAY_CHAIN_HOP) {
       this.log(`[${this.seatId}] suppressed relay loop: ${previewText(payload)}`);
       return;
     }
@@ -1223,6 +1270,7 @@ class ArmedSeat {
     this.writeStatus({
       state: live.state,
       agent: live.agent,
+      flowMode: this.flowMode,
       cwd: live.cwd,
       log: live.log,
       lastAnswerAt: live.lastAnswerAt,
@@ -1239,7 +1287,8 @@ class ArmedSeat {
     this.installResizeHandler();
 
     this.log(`${BRAND} seat ${this.seatId} armed for ${this.sessionName}.`);
-    this.log("Use this shell normally. Codex, Claude, and Gemini final answers relay automatically from their local session logs.");
+    this.log("Use this shell normally. Codex, Claude, and Gemini relay automatically from their local session logs.");
+    this.log(`Seat ${this.seatId} relay mode is flow ${this.flowMode}.`);
     if (this.seatId === 1) {
       this.log("Seat 1 generated the session key and is waiting for seat 2 to sign it.");
     } else {
@@ -1339,6 +1388,7 @@ function buildSeatReport(sessionName, seatId) {
   return {
     seatId,
     state: wrapperLive ? status?.state || "running" : "orphaned_child",
+    flowMode: status?.flowMode || meta?.flowMode || "off",
     wrapperPid,
     childPid,
     wrapperLive,

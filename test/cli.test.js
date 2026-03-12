@@ -29,6 +29,7 @@ async function main() {
   testUsage();
   testRejectsExtraArgs();
   testCodexParsing();
+  testCodexFlowParsing();
   testClaudeParsing();
   testGeminiParsing();
   testLateAttachFiltering();
@@ -46,6 +47,8 @@ async function main() {
   await testMirrorRepliesDoNotPingPong();
   await testAlternatingRepliesStopAfterSingleBounce();
   await testQueuedRepliesAfterInboundStaySuppressed();
+  await testMultilineRelaySubmitsOnce();
+  await testSeatSpecificFlowModes();
   await testStopSilencesBellLoop();
   process.stdout.write("muuuuse tests passed\n");
 }
@@ -69,7 +72,7 @@ function testRejectsExtraArgs() {
       stdio: "pipe",
       env: process.env,
     });
-  }, /takes no extra arguments/i);
+  }, /accepts either no extra arguments or `flow on` \/ `flow off`/i);
 }
 
 function testCodexParsing() {
@@ -109,6 +112,41 @@ function testCodexParsing() {
   }));
 
   assert.equal(ignored, null);
+}
+
+function testCodexFlowParsing() {
+  const codexFile = path.join(os.tmpdir(), `muuuuse-codex-flow-${Date.now()}.jsonl`);
+  fs.writeFileSync(codexFile, [
+    JSON.stringify({
+      type: "response_item",
+      timestamp: "2026-03-09T12:00:00.000Z",
+      payload: {
+        id: "codex-commentary",
+        type: "message",
+        role: "assistant",
+        phase: "commentary",
+        content: [{ type: "output_text", text: "Thinking out loud." }],
+      },
+    }),
+    JSON.stringify({
+      type: "response_item",
+      timestamp: "2026-03-09T12:00:01.000Z",
+      payload: {
+        id: "codex-final",
+        type: "message",
+        role: "assistant",
+        phase: "final_answer",
+        content: [{ type: "output_text", text: "Final answer." }],
+      },
+    }),
+  ].join("\n") + "\n");
+
+  const flowOff = readCodexAnswers(codexFile, 0, null, { flowMode: false });
+  const flowOn = readCodexAnswers(codexFile, 0, null, { flowMode: true });
+  fs.rmSync(codexFile, { force: true });
+
+  assert.deepEqual(flowOff.answers.map((entry) => entry.id), ["codex-final"]);
+  assert.deepEqual(flowOn.answers.map((entry) => entry.id), ["codex-commentary", "codex-final"]);
 }
 
 function testClaudeParsing() {
@@ -740,6 +778,84 @@ async function testQueuedRepliesAfterInboundStaySuppressed() {
   }
 }
 
+async function testMultilineRelaySubmitsOnce() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-multiline-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-multiline-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home });
+  const seat2 = spawnSeat(2, { cwd, home });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
+
+    seat1.write(`MOCK_REPLY_TEXT='ALPHA\\nBETA' ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`MOCK_REPLY_MODE=mirror ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+
+    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
+
+    seat1.write("go\r");
+
+    await seat1.waitFor(/ALPHA/);
+    await seat1.waitFor(/BETA/);
+    await seat2.waitFor(/ALPHA BETA/);
+    await sleep(1500);
+
+    const seat1Events = readAnswerEvents(home, sessionName, 1);
+    const seat2Events = readAnswerEvents(home, sessionName, 2);
+
+    assert.deepEqual(seat1Events.map((entry) => entry.text), ["ALPHA\nBETA"]);
+    assert.deepEqual(seat2Events.map((entry) => entry.text), ["ALPHA BETA"]);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
+}
+
+async function testSeatSpecificFlowModes() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-flow-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-flow-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["flow", "on"] });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "off"] });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
+
+    seat1.write(`${shellQuote(noisyCodexPath)}\r`);
+    seat2.write(`MOCK_REPLY_MODE=mirror ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+
+    await waitForStatus(home, cwd, /seat 1: running .*flow on/i);
+    await waitForStatus(home, cwd, /seat 2: running .*flow off/i);
+
+    seat1.write("Reply with exactly FLOW_ON and nothing else.\r");
+
+    await seat2.waitFor(/Thinking about:/);
+    await seat2.waitFor(/Still reasoning on turn 1\./);
+    await seat2.waitFor(/FLOW_ON/);
+    await sleep(1200);
+
+    const seat1Events = readAnswerEvents(home, sessionName, 1);
+
+    assert(seat1Events.some((entry) => entry.text.includes("Thinking about:")));
+    assert(seat1Events.some((entry) => entry.text.includes("Still reasoning on turn 1.")));
+    assert(seat1Events.some((entry) => entry.text.includes("FLOW_ON")));
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
+}
+
 async function testStopSilencesBellLoop() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-bell-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-bell-cwd-"));
@@ -857,8 +973,8 @@ function buildEnv(home) {
   };
 }
 
-function spawnSeat(seatId, { cwd, home }) {
-  const term = pty.spawn(process.execPath, [binPath, String(seatId)], {
+function spawnSeat(seatId, { cwd, home, extraArgs = [] }) {
+  const term = pty.spawn(process.execPath, [binPath, String(seatId), ...extraArgs], {
     cwd,
     env: buildEnv(home),
     cols: 100,

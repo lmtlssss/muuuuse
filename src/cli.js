@@ -55,12 +55,10 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   if (command === "1" || command === "2") {
-    if (argv.length > 1) {
-      throw new Error(`\`muuuuse ${command}\` takes no extra arguments. Run it directly in the terminal you want to arm.`);
-    }
-
+    const flowMode = parseSeatFlowMode(command, argv.slice(1));
     const seat = new ArmedSeat({
       cwd: process.cwd(),
+      flowMode,
       seatId: Number(command),
     });
     const code = await seat.run();
@@ -74,6 +72,7 @@ function renderSeatStatus(seat) {
   const bits = [
     `seat ${seat.seatId}: ${seat.state}`,
     `agent ${seat.agent || "idle"}`,
+    `flow ${seat.flowMode || "off"}`,
     `relays ${seat.relayCount}`,
     `wrapper ${seat.wrapperPid || "-"}`,
     `child ${seat.childPid || "-"}`,
@@ -97,6 +96,23 @@ function renderSeatStatus(seat) {
     output += `log: ${seat.log}\n`;
   }
   return output;
+}
+
+function parseSeatFlowMode(command, args) {
+  if (args.length === 0) {
+    return "off";
+  }
+
+  if (args.length === 2 && String(args[0]).trim().toLowerCase() === "flow") {
+    const flowMode = String(args[1]).trim().toLowerCase();
+    if (flowMode === "on" || flowMode === "off") {
+      return flowMode;
+    }
+  }
+
+  throw new Error(
+    `\`muuuuse ${command}\` accepts either no extra arguments or \`flow on\` / \`flow off\`. Run it directly in the terminal you want to arm.`
+  );
 }
 
 module.exports = {

@@ -7,6 +7,7 @@ const readline = require("node:readline");
 
 const cwd = process.cwd();
 let turn = 0;
+let messageSequence = 0;
 let keepaliveFd = null;
 
 const dir = path.join(os.homedir(), ".codex", "sessions", "mock");
@@ -48,11 +49,12 @@ rl.on("line", (line) => {
 });
 
 function appendAssistant(phase, text) {
+  messageSequence += 1;
   fs.appendFileSync(filePath, `${JSON.stringify({
     type: "response_item",
     timestamp: new Date().toISOString(),
     payload: {
-      id: `${phase}-${turn}-${Date.now()}`,
+      id: `${phase}-${turn}-${messageSequence}`,
       type: "message",
       role: "assistant",
       phase,

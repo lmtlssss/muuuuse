@@ -459,14 +459,17 @@ function extractCodexAssistantText(content) {
     .join("\n");
 }
 
-function parseCodexFinalLine(line) {
+function parseCodexAssistantLine(line, options = {}) {
+  const flowMode = options.flowMode === true;
   try {
     const entry = JSON.parse(line);
     if (entry?.type !== "response_item" || entry.payload?.type !== "message" || entry.payload?.role !== "assistant") {
       return null;
     }
 
-    if (entry.payload?.phase !== "final_answer") {
+    const phase = String(entry.payload?.phase || "").trim().toLowerCase();
+    const relayablePhase = phase === "final_answer" || (flowMode && phase === "commentary");
+    if (!relayablePhase) {
       return null;
     }
 
@@ -485,6 +488,10 @@ function parseCodexFinalLine(line) {
   }
 }
 
+function parseCodexFinalLine(line) {
+  return parseCodexAssistantLine(line, { flowMode: false });
+}
+
 function isAnswerNewEnough(answer, sinceMs = null) {
   if (!Number.isFinite(sinceMs)) {
     return true;
@@ -498,13 +505,13 @@ function isAnswerNewEnough(answer, sinceMs = null) {
   return answerMs >= sinceMs;
 }
 
-function readCodexAnswers(filePath, offset, sinceMs = null) {
+function readCodexAnswers(filePath, offset, sinceMs = null, options = {}) {
   const { nextOffset, text } = readAppendedText(filePath, offset);
   const answers = text
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
-    .map((line) => parseCodexFinalLine(line))
+    .map((line) => parseCodexAssistantLine(line, options))
     .filter((entry) => entry !== null)
     .filter((entry) => isAnswerNewEnough(entry, sinceMs));
 
@@ -547,7 +554,8 @@ function selectClaudeSessionFile(currentPath, processStartedAtMs, options = {}) 
   return selectSessionCandidatePath(candidates, currentPath, processStartedAtMs);
 }
 
-function extractClaudeAssistantText(content) {
+function extractClaudeAssistantText(content, options = {}) {
+  const flowMode = options.flowMode === true;
   if (!Array.isArray(content)) {
     return "";
   }
@@ -560,20 +568,28 @@ function extractClaudeAssistantText(content) {
       if (item.type === "text" && typeof item.text === "string") {
         return [item.text.trim()];
       }
+      if (flowMode && item.type === "thinking" && typeof item.thinking === "string") {
+        return [item.thinking.trim()];
+      }
       return [];
     })
     .filter((text) => text.length > 0)
     .join("\n");
 }
 
-function parseClaudeFinalLine(line) {
+function parseClaudeAssistantLine(line, options = {}) {
+  const flowMode = options.flowMode === true;
   try {
     const entry = JSON.parse(line);
-    if (entry?.type !== "assistant" || entry.message?.role !== "assistant" || entry.message?.stop_reason !== "end_turn") {
+    if (entry?.type !== "assistant" || entry.message?.role !== "assistant") {
       return null;
     }
 
-    const text = sanitizeRelayText(extractClaudeAssistantText(entry.message.content));
+    if (!flowMode && entry.message?.stop_reason !== "end_turn") {
+      return null;
+    }
+
+    const text = sanitizeRelayText(extractClaudeAssistantText(entry.message.content, options));
     if (!text) {
       return null;
     }
@@ -588,13 +604,17 @@ function parseClaudeFinalLine(line) {
   }
 }
 
-function readClaudeAnswers(filePath, offset, sinceMs = null) {
+function parseClaudeFinalLine(line) {
+  return parseClaudeAssistantLine(line, { flowMode: false });
+}
+
+function readClaudeAnswers(filePath, offset, sinceMs = null, options = {}) {
   const { nextOffset, text } = readAppendedText(filePath, offset);
   const answers = text
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
-    .map((line) => parseClaudeFinalLine(line))
+    .map((line) => parseClaudeAssistantLine(line, options))
     .filter((entry) => entry !== null)
     .filter((entry) => isAnswerNewEnough(entry, sinceMs));
 
