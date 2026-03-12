@@ -21,7 +21,6 @@ const {
 const {
   buildChildEnv,
   chunkRelayPayloadForTyping,
-  getEscapeRelayDelayMs,
   isBareEscapeInput,
   isMeaningfulTerminalInput,
   normalizeRelayPayloadForTyping,
@@ -43,7 +42,6 @@ async function main() {
   testSessionCandidateSelection();
   testChildEnvScrubsOuterCodexState();
   testTerminalInputFiltering();
-  testEscapeRelayDelay();
   testRelayTypingChunks();
   testAgentDetection();
   testAgentDetectionPrefersShallowCodexWrapper();
@@ -381,14 +379,6 @@ function testTerminalInputFiltering() {
   assert.equal(isMeaningfulTerminalInput("\u001b[A"), true);
   assert.equal(isMeaningfulTerminalInput("\r"), true);
   assert.equal(isMeaningfulTerminalInput("go"), true);
-}
-
-function testEscapeRelayDelay() {
-  assert.equal(getEscapeRelayDelayMs(Number.NaN, 1000), 0);
-  assert.equal(getEscapeRelayDelayMs(0, 1000), 0);
-  assert.equal(getEscapeRelayDelayMs(1000, 1000), 180);
-  assert.equal(getEscapeRelayDelayMs(900, 1000), 80);
-  assert.equal(getEscapeRelayDelayMs(700, 1000), 0);
 }
 
 function testRelayTypingChunks() {

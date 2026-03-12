@@ -35,9 +35,8 @@ const {
   writeJson,
 } = require("./util");
 
-const TYPE_CHUNK_DELAY_MS = 12;
-const TYPE_CHUNK_SIZE = 6;
-const ESCAPE_RELAY_GUARD_MS = 180;
+const TYPE_CHUNK_DELAY_MS = 18;
+const TYPE_CHUNK_SIZE = 24;
 const MIRROR_SUPPRESSION_WINDOW_MS = 30 * 1000;
 const PENDING_RELAY_CONTEXT_TTL_MS = 2 * 60 * 1000;
 const EMITTED_ANSWER_TTL_MS = 5 * 60 * 1000;
@@ -479,19 +478,6 @@ function isMeaningfulTerminalInput(input) {
   return stripPassiveTerminalInput(input).length > 0;
 }
 
-function getEscapeRelayDelayMs(lastEscapeAtMs, now = Date.now()) {
-  if (!Number.isFinite(lastEscapeAtMs) || lastEscapeAtMs <= 0) {
-    return 0;
-  }
-
-  const elapsedMs = now - lastEscapeAtMs;
-  if (elapsedMs >= ESCAPE_RELAY_GUARD_MS) {
-    return 0;
-  }
-
-  return ESCAPE_RELAY_GUARD_MS - elapsedMs;
-}
-
 async function sendTextAndEnter(child, text, shouldAbort = () => false) {
   const payload = normalizeRelayPayloadForTyping(text);
 
@@ -551,7 +537,6 @@ class ArmedSeat {
     this.forceKillTimer = null;
     this.identity = null;
     this.lastUserInputAtMs = 0;
-    this.lastEscapeAtMs = 0;
     this.pendingInboundContext = null;
     this.recentInboundRelays = [];
     this.recentEmittedAnswers = [];
@@ -829,9 +814,6 @@ class ArmedSeat {
   installStdinProxy() {
     const handleData = (chunk) => {
       const chunkText = chunk.toString("utf8");
-      if (isBareEscapeInput(chunkText)) {
-        this.lastEscapeAtMs = Date.now();
-      }
       if (isMeaningfulTerminalInput(chunkText)) {
         this.lastUserInputAtMs = Date.now();
         this.pendingInboundContext = null;
@@ -992,11 +974,6 @@ class ArmedSeat {
         !verifyText(signaturePayload, entry.signature, this.trustState.peerPublicKey)
       ) {
         continue;
-      }
-
-      const escapeRelayDelayMs = getEscapeRelayDelayMs(this.lastEscapeAtMs);
-      if (escapeRelayDelayMs > 0) {
-        await sleep(escapeRelayDelayMs);
       }
 
       const delivered = await sendTextAndEnter(
@@ -1543,7 +1520,6 @@ module.exports = {
   ArmedSeat,
   buildChildEnv,
   chunkRelayPayloadForTyping,
-  getEscapeRelayDelayMs,
   getStatusReport,
   isBareEscapeInput,
   isMeaningfulTerminalInput,
