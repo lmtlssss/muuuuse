@@ -69,7 +69,7 @@ muuuuse 2 bash -lc 'while read line; do printf "right: %s\n\n" "$line"; done'
 
 Type into one seat and the other seat will receive the relayed block.
 
-For Codex, Claude, and Gemini, `🔌Muuuuse` prefers their structured session logs. For anything else, it falls back to the last stable output block after a turn goes idle.
+For Codex, Claude, and Gemini, `🔌Muuuuse` waits for their structured final-answer logs instead of relaying transient screen chatter. For anything else, it first looks for an explicit `(answer)` block and otherwise falls back to the last stable output block after a turn goes idle.
 
 ## Sessions
 

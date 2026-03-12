@@ -7,6 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const {
+  chooseCandidate,
   detectAgent,
   parseClaudeFinalLine,
   parseCodexFinalLine,
@@ -19,6 +20,7 @@ async function main() {
   testClaudeParsing();
   testGeminiParsing();
   testAgentDetection();
+  testCandidateSelectionAvoidsAmbiguousFallback();
   testPresetExpansion();
   await testWrappedSeatRelay();
   process.stdout.write("muuuuse tests passed\n");
@@ -105,6 +107,26 @@ function testAgentDetection() {
 
   assert.equal(detected.type, "codex");
   assert.equal(detected.pid, 22);
+}
+
+function testCandidateSelectionAvoidsAmbiguousFallback() {
+  const candidates = [
+    {
+      path: "/tmp/a.jsonl",
+      cwd: "/root/project",
+      startedAtMs: Date.parse("2026-03-12T01:00:00.000Z"),
+      mtimeMs: 10,
+    },
+    {
+      path: "/tmp/b.jsonl",
+      cwd: "/root/project",
+      startedAtMs: Date.parse("2026-03-12T01:00:02.000Z"),
+      mtimeMs: 20,
+    },
+  ];
+
+  const selected = chooseCandidate(candidates, "/root/project", Date.parse("2026-03-12T01:00:01.000Z"));
+  assert.equal(selected, null);
 }
 
 function testPresetExpansion() {

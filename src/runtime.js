@@ -31,7 +31,6 @@ const {
 } = require("./util");
 
 const GENERIC_IDLE_MS = 900;
-const GENERIC_FALLBACK_DELAY_MS = 4000;
 
 function resolveSessionName(sessionOverride, currentPath = process.cwd()) {
   return sessionOverride || getDefaultSessionName(currentPath);
@@ -79,9 +78,9 @@ function parseAnswerEntries(text) {
     .filter((entry) => entry && entry.type === "answer" && typeof entry.text === "string");
 }
 
-function resolveSessionFile(agentType, currentPath, processStartedAtMs) {
+function resolveSessionFile(agentType, currentPath, processStartedAtMs, options = {}) {
   if (agentType === "codex") {
-    return selectCodexSessionFile(currentPath, processStartedAtMs);
+    return selectCodexSessionFile(currentPath, processStartedAtMs, options);
   }
   if (agentType === "claude") {
     return selectClaudeSessionFile(currentPath, processStartedAtMs);
@@ -161,6 +160,11 @@ function extractGenericAnswer(rawText, lastInputText) {
     }
   }
 
+  const markerAnswer = extractMarkedAnswer(candidate);
+  if (markerAnswer) {
+    return markerAnswer;
+  }
+
   const blocks = candidate
     .split(/\n{2,}/)
     .map((block) => block.trim())
@@ -171,6 +175,18 @@ function extractGenericAnswer(rawText, lastInputText) {
   }
 
   return sanitizeRelayText(blocks[blocks.length - 1]);
+}
+
+function extractMarkedAnswer(content) {
+  const lines = String(content || "").split("\n");
+  const answerIndex = lines.findIndex((line) => line.trim().startsWith("(answer)"));
+  if (answerIndex === -1) {
+    return null;
+  }
+
+  const answerLines = lines.slice(answerIndex);
+  answerLines[0] = answerLines[0].trim().replace(/^\(answer\)\s*/, "");
+  return sanitizeRelayText(answerLines.join("\n"));
 }
 
 class SeatProcess {
@@ -196,6 +212,8 @@ class SeatProcess {
     this.stopped = false;
     this.stdinCleanup = null;
     this.resizeCleanup = null;
+    this.childToken = createId(16);
+    this.processStartedAtMs = null;
 
     this.sessionState = {
       file: null,
@@ -217,6 +235,7 @@ class SeatProcess {
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
+      childToken: this.childToken,
       agentType: this.agentType,
       command: this.commandTokens,
       commandLine: formatCommand(this.commandTokens),
@@ -232,6 +251,7 @@ class SeatProcess {
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
+      childToken: this.childToken,
       agentType: this.agentType,
       command: this.commandTokens,
       relayCount: this.relayCount,
@@ -307,6 +327,7 @@ class SeatProcess {
       cwd: this.cwd,
       env: {
         ...process.env,
+        MUUUUSE_CHILD_TOKEN: this.childToken,
         MUUUUSE_SEAT: String(this.seatId),
         MUUUUSE_SESSION: this.sessionName,
       },
@@ -315,6 +336,7 @@ class SeatProcess {
     });
 
     this.childPid = this.child.pid;
+    this.processStartedAtMs = Date.now();
     this.writeMeta();
     this.writeStatus({
       partnerSeatId: this.partnerSeatId,
@@ -352,15 +374,7 @@ class SeatProcess {
   }
 
   shouldUseGenericCapture() {
-    if (!this.agentType) {
-      return true;
-    }
-
-    if (this.sessionState.file) {
-      return false;
-    }
-
-    return Date.now() - this.startedAtMs >= GENERIC_FALLBACK_DELAY_MS;
+    return !this.agentType;
   }
 
   pullPartnerEvents() {
@@ -401,7 +415,15 @@ class SeatProcess {
       return;
     }
 
-    const sessionFile = resolveSessionFile(this.agentType, this.cwd, this.startedAtMs);
+    const sessionFile = resolveSessionFile(this.agentType, this.cwd, this.processStartedAtMs, {
+      snapshotEnv: this.agentType === "codex"
+        ? {
+          MUUUUSE_CHILD_TOKEN: this.childToken,
+          MUUUUSE_SEAT: String(this.seatId),
+          MUUUUSE_SESSION: this.sessionName,
+        }
+        : null,
+    });
     if (!sessionFile) {
       return;
     }

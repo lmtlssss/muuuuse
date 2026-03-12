@@ -76,6 +76,7 @@ const CLAUDE_ROOT = path.join(os.homedir(), ".claude", "projects");
 const GEMINI_ROOT = path.join(os.homedir(), ".gemini", "tmp");
 const CODEX_SNAPSHOT_ROOT = path.join(os.homedir(), ".codex", "shell_snapshots");
 const codexSnapshotPaneCache = new Map();
+const codexSnapshotExportsCache = new Map();
 
 function walkFiles(rootPath, predicate, results = []) {
   try {
@@ -157,6 +158,10 @@ function chooseCandidate(candidates, currentPath, processStartedAtMs) {
     return null;
   }
 
+  if (cwdMatches.length === 1) {
+    return cwdMatches[0].path;
+  }
+
   if (processStartedAtMs !== null) {
     const preciseMatches = cwdMatches
       .map((candidate) => ({
@@ -166,13 +171,12 @@ function chooseCandidate(candidates, currentPath, processStartedAtMs) {
       .filter((candidate) => Number.isFinite(candidate.diffMs) && candidate.diffMs <= SESSION_MATCH_WINDOW_MS)
       .sort((left, right) => left.diffMs - right.diffMs || right.mtimeMs - left.mtimeMs);
 
-    if (preciseMatches.length > 0) {
+    if (preciseMatches.length === 1) {
       return preciseMatches[0].path;
     }
   }
 
-  const fallback = cwdMatches.sort((left, right) => right.mtimeMs - left.mtimeMs)[0];
-  return fallback ? fallback.path : null;
+  return null;
 }
 
 function extractThreadId(filePath) {
@@ -202,6 +206,49 @@ function readCodexSnapshotPane(threadId) {
   }
 }
 
+function readCodexSnapshotExports(threadId) {
+  if (!threadId) {
+    return {};
+  }
+
+  if (codexSnapshotExportsCache.has(threadId)) {
+    return codexSnapshotExportsCache.get(threadId);
+  }
+
+  const snapshotPath = path.join(CODEX_SNAPSHOT_ROOT, `${threadId}.sh`);
+  try {
+    const contents = fs.readFileSync(snapshotPath, "utf8");
+    const exportsMap = {};
+    const pattern = /^declare -x ([A-Z0-9_]+)="((?:[^"\\]|\\.)*)"$/gm;
+
+    for (const match of contents.matchAll(pattern)) {
+      const [, key = "", rawValue = ""] = match;
+      exportsMap[key] = rawValue
+        .replace(/\\"/g, "\"")
+        .replace(/\\\\/g, "\\");
+    }
+
+    codexSnapshotExportsCache.set(threadId, exportsMap);
+    return exportsMap;
+  } catch (error) {
+    codexSnapshotExportsCache.set(threadId, {});
+    return {};
+  }
+}
+
+function snapshotEnvMatches(exportsMap, expectedEnv = null) {
+  if (!expectedEnv || typeof expectedEnv !== "object") {
+    return true;
+  }
+
+  return Object.entries(expectedEnv).every(([key, value]) => {
+    if (value === undefined || value === null) {
+      return true;
+    }
+    return exportsMap[key] === String(value);
+  });
+}
+
 function readCodexCandidate(filePath) {
   try {
     const [firstLine] = readFirstLines(filePath, 1);
@@ -216,6 +263,7 @@ function readCodexCandidate(filePath) {
     return {
       path: filePath,
       threadId: extractThreadId(filePath),
+      snapshotExports: readCodexSnapshotExports(extractThreadId(filePath)),
       snapshotPaneId: readCodexSnapshotPane(extractThreadId(filePath)),
       cwd: entry.payload.cwd,
       startedAtMs: Date.parse(entry.payload.timestamp),
@@ -226,12 +274,24 @@ function readCodexCandidate(filePath) {
   }
 }
 
-function selectCodexSessionFile(currentPath, processStartedAtMs, paneId = null) {
+function selectCodexSessionFile(currentPath, processStartedAtMs, options = {}) {
+  const paneId = options.paneId || null;
+  const snapshotEnv = options.snapshotEnv || null;
   const candidates = walkFiles(CODEX_ROOT, (filePath) => filePath.endsWith(".jsonl"))
     .map((filePath) => readCodexCandidate(filePath))
     .filter((candidate) => candidate !== null);
 
   let scopedCandidates = candidates;
+  if (snapshotEnv) {
+    const exactEnvMatches = scopedCandidates.filter((candidate) => snapshotEnvMatches(candidate.snapshotExports, snapshotEnv));
+    if (exactEnvMatches.length === 1) {
+      return exactEnvMatches[0].path;
+    }
+    if (exactEnvMatches.length > 1) {
+      scopedCandidates = exactEnvMatches;
+    }
+  }
+
   if (paneId) {
     const exactPaneMatches = scopedCandidates.filter((candidate) => candidate.snapshotPaneId === paneId);
     if (exactPaneMatches.length > 0) {
@@ -415,12 +475,16 @@ function selectGeminiSessionFile(currentPath, processStartedAtMs) {
       .filter((candidate) => Number.isFinite(candidate.diffMs) && candidate.diffMs <= SESSION_MATCH_WINDOW_MS)
       .sort((left, right) => left.diffMs - right.diffMs || right.lastUpdatedMs - left.lastUpdatedMs);
 
-    if (preciseMatches.length > 0) {
+    if (preciseMatches.length === 1) {
       return preciseMatches[0].path;
     }
   }
 
-  return candidates.sort((left, right) => right.lastUpdatedMs - left.lastUpdatedMs || right.mtimeMs - left.mtimeMs)[0].path;
+  if (candidates.length === 1) {
+    return candidates[0].path;
+  }
+
+  return null;
 }
 
 function readGeminiAnswers(filePath, lastMessageId = null) {
@@ -460,6 +524,7 @@ function readGeminiAnswers(filePath, lastMessageId = null) {
 
 module.exports = {
   PRESETS,
+  chooseCandidate,
   detectAgent,
   detectAgentTypeFromCommand,
   expandPresetCommand,
