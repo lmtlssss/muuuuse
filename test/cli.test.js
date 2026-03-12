@@ -21,6 +21,8 @@ const {
 const {
   buildChildEnv,
   chunkRelayPayloadForTyping,
+  getEscapeRelayDelayMs,
+  isBareEscapeInput,
   isMeaningfulTerminalInput,
   normalizeRelayPayloadForTyping,
 } = require("../src/runtime");
@@ -41,6 +43,7 @@ async function main() {
   testSessionCandidateSelection();
   testChildEnvScrubsOuterCodexState();
   testTerminalInputFiltering();
+  testEscapeRelayDelay();
   testRelayTypingChunks();
   testAgentDetection();
   testAgentDetectionPrefersShallowCodexWrapper();
@@ -56,6 +59,7 @@ async function main() {
   await testQueuedRepliesAfterInboundStaySuppressed();
   await testMultilineRelaySubmitsOnce();
   await testPassiveTerminalReportsDoNotClearRelayContext();
+  await testBareEscapeDoesNotClearRelayContext();
   await testSeatSpecificFlowModes();
   await testStopSilencesBellLoop();
   process.stdout.write("muuuuse tests passed\n");
@@ -366,6 +370,8 @@ function testChildEnvScrubsOuterCodexState() {
 }
 
 function testTerminalInputFiltering() {
+  assert.equal(isBareEscapeInput("\u001b"), true);
+  assert.equal(isMeaningfulTerminalInput("\u001b"), false);
   assert.equal(isMeaningfulTerminalInput("\u001b[I"), false);
   assert.equal(isMeaningfulTerminalInput("\u001b[O"), false);
   assert.equal(isMeaningfulTerminalInput("\u001b]10;rgb:ffff/ffff/ffff\u001b\\"), false);
@@ -375,6 +381,14 @@ function testTerminalInputFiltering() {
   assert.equal(isMeaningfulTerminalInput("\u001b[A"), true);
   assert.equal(isMeaningfulTerminalInput("\r"), true);
   assert.equal(isMeaningfulTerminalInput("go"), true);
+}
+
+function testEscapeRelayDelay() {
+  assert.equal(getEscapeRelayDelayMs(Number.NaN, 1000), 0);
+  assert.equal(getEscapeRelayDelayMs(0, 1000), 0);
+  assert.equal(getEscapeRelayDelayMs(1000, 1000), 180);
+  assert.equal(getEscapeRelayDelayMs(900, 1000), 80);
+  assert.equal(getEscapeRelayDelayMs(700, 1000), 0);
 }
 
 function testRelayTypingChunks() {
@@ -873,6 +887,49 @@ async function testPassiveTerminalReportsDoNotClearRelayContext() {
     await seat1.waitFor(/\bONE\b/);
     await sleep(300);
     seat2.write("\u001b[I\u001b]10;rgb:ffff/ffff/ffff\u001b\\\u001b]11;rgb:0000/0000/0000\u001b\\\u001b[12;34R");
+
+    await seat2.waitFor(/\bTWO\b/);
+    await sleep(1200);
+
+    const seat1Events = readAnswerEvents(home, sessionName, 1);
+    const seat2Events = readAnswerEvents(home, sessionName, 2);
+
+    assert.deepEqual(seat1Events.map((entry) => entry.text), ["ONE"]);
+    assert.deepEqual(seat2Events.map((entry) => entry.text), ["TWO"]);
+    assert.equal(seat2Events[0].hop, 1);
+    assert.equal(seat2Events[0].chainId, seat1Events[0].id);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
+}
+
+async function testBareEscapeDoesNotClearRelayContext() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-escape-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-escape-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home });
+  const seat2 = spawnSeat(2, { cwd, home });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
+
+    seat1.write(`MOCK_REPLY_TEXT=ONE ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`MOCK_REPLY_TEXT=TWO MOCK_REPLY_DELAY_MS=900 ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+
+    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
+
+    seat1.write("go\r");
+
+    await seat1.waitFor(/\bONE\b/);
+    await sleep(300);
+    seat2.write("\u001b");
 
     await seat2.waitFor(/\bTWO\b/);
     await sleep(1200);
