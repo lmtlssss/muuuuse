@@ -23,6 +23,7 @@ async function main() {
   testCandidateSelectionAvoidsAmbiguousFallback();
   testPresetExpansion();
   await testSeatStopsWhenInputCloses();
+  await testStopKillsChildDescendants();
   await testWrappedSeatRelay();
   process.stdout.write("muuuuse tests passed\n");
 }
@@ -243,6 +244,49 @@ async function testSeatStopsWhenInputCloses() {
   }
 }
 
+async function testStopKillsChildDescendants() {
+  const root = path.resolve(__dirname, "..");
+  const cliPath = path.join(root, "bin", "muuse.js");
+  const pidFile = path.join(os.tmpdir(), `muuuuse-descendant-${Date.now()}.pid`);
+  const spawnGrandchildPath = path.join(root, "test", "fixtures", "spawn-grandchild.js");
+  const sessionName = `muuuuse-desc-${Date.now()}`;
+
+  const seat = spawn(process.execPath, [
+    cliPath,
+    "1",
+    "--session",
+    sessionName,
+    process.execPath,
+    spawnGrandchildPath,
+    pidFile,
+  ], {
+    cwd: root,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  try {
+    await waitForStream(seat.stderr, /seat 1 started/i, 10000);
+    const grandchildPid = await waitForPidFile(pidFile, 10000);
+    assert.equal(isAlive(grandchildPid), true);
+
+    execFileSync(process.execPath, [
+      cliPath,
+      "stop",
+      "--session",
+      sessionName,
+    ], {
+      cwd: root,
+      encoding: "utf8",
+    });
+
+    await waitForExit(seat, 10000);
+    await waitForCondition(() => !isAlive(grandchildPid), 10000);
+  } finally {
+    safeKill(seat);
+    fs.rmSync(pidFile, { force: true });
+  }
+}
+
 function waitForStream(stream, pattern, timeoutMs) {
   return new Promise((resolve, reject) => {
     let collected = "";
@@ -291,6 +335,31 @@ function safeKill(child) {
   } catch (error) {
     // Ignore cleanup races.
   }
+}
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function waitForPidFile(filePath, timeoutMs) {
+  await waitForCondition(() => fs.existsSync(filePath), timeoutMs);
+  return Number.parseInt(fs.readFileSync(filePath, "utf8").trim(), 10);
+}
+
+async function waitForCondition(check, timeoutMs) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (check()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("Timed out waiting for condition");
 }
 
 main().catch((error) => {

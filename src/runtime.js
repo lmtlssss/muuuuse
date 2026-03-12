@@ -17,12 +17,14 @@ const {
   POLL_MS,
   appendJsonl,
   createId,
+  getDescendantPids,
   getDefaultSessionName,
   getFileSize,
   getSeatPaths,
   getStateRoot,
   hashText,
   isPidAlive,
+  readProcessGroupId,
   readAppendedText,
   readJson,
   resetDir,
@@ -206,6 +208,7 @@ class SeatProcess {
 
     this.child = null;
     this.childPid = null;
+    this.childPgid = null;
     this.childExit = null;
     this.startedAtMs = Date.now();
     this.relayCount = 0;
@@ -236,6 +239,7 @@ class SeatProcess {
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
+      childPgid: this.childPgid,
       childToken: this.childToken,
       agentType: this.agentType,
       command: this.commandTokens,
@@ -252,6 +256,7 @@ class SeatProcess {
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
+      childPgid: this.childPgid,
       childToken: this.childToken,
       agentType: this.agentType,
       command: this.commandTokens,
@@ -345,6 +350,7 @@ class SeatProcess {
     });
 
     this.childPid = this.child.pid;
+    this.childPgid = readProcessGroupId(this.childPid) || this.childPid;
     this.processStartedAtMs = Date.now();
     this.writeMeta();
     this.writeStatus({
@@ -561,26 +567,95 @@ class SeatProcess {
       this.resizeCleanup = null;
     }
 
-    if (this.child && !this.childExit) {
-      try {
-        this.child.kill("SIGTERM");
-      } catch (error) {
-        // Ignore races during shutdown.
-      }
-    }
+    stopTrackedSeat({
+      childPid: this.childPid,
+      childPgid: this.childPgid,
+      wrapperPid: null,
+    });
 
     this.writeMeta({
       childPid: this.childPid,
+      childPgid: this.childPgid,
       exitedAt: new Date().toISOString(),
     });
     this.writeStatus({
       childPid: this.childPid,
+      childPgid: this.childPgid,
       exitCode: this.childExit?.exitCode ?? null,
       exitedAt: new Date().toISOString(),
       partnerSeatId: this.partnerSeatId,
       state: "exited",
     });
   }
+}
+
+function uniquePids(pids) {
+  return [...new Set(pids.filter((pid) => Number.isInteger(pid) && pid > 0))];
+}
+
+function signalPid(pid, signal) {
+  if (!Number.isInteger(pid) || pid <= 0 || !isPidAlive(pid)) {
+    return false;
+  }
+
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function signalProcessGroup(pgid, signal) {
+  if (!Number.isInteger(pgid) || pgid <= 0) {
+    return false;
+  }
+
+  try {
+    process.kill(-pgid, signal);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function stopTrackedSeat({ wrapperPid = null, childPid = null, childPgid = null }) {
+  const descendantPids = uniquePids([
+    ...getDescendantPids(wrapperPid),
+    ...getDescendantPids(childPid),
+  ]);
+
+  const allPids = uniquePids([
+    wrapperPid,
+    childPid,
+    ...descendantPids,
+  ]);
+
+  const wrapperStopped = signalPid(wrapperPid, "SIGTERM");
+  const childStopped = signalPid(childPid, "SIGTERM");
+  let groupStopped = signalProcessGroup(childPgid, "SIGTERM");
+
+  for (const pid of descendantPids) {
+    signalPid(pid, "SIGTERM");
+  }
+
+  const survivors = allPids.filter((pid) => isPidAlive(pid));
+  if (survivors.length > 0) {
+    groupStopped = signalProcessGroup(childPgid, "SIGKILL") || groupStopped;
+    for (const pid of survivors) {
+      signalPid(pid, "SIGKILL");
+    }
+  }
+
+  return {
+    childForced: survivors.some((pid) => pid === childPid),
+    childPid,
+    childStopped: childStopped || groupStopped,
+    descendantPids,
+    wrapperForced: survivors.some((pid) => pid === wrapperPid),
+    wrapperPid,
+    wrapperStopped,
+  };
 }
 
 function stopSession(sessionName) {
@@ -592,34 +667,15 @@ function stopSession(sessionName) {
     const meta = readJson(paths.metaPath, null);
     const wrapperPid = status?.pid || meta?.pid || null;
     const childPid = status?.childPid || meta?.childPid || null;
-
-    let wrapperStopped = false;
-    let childStopped = false;
-
-    if (wrapperPid && isPidAlive(wrapperPid)) {
-      try {
-        process.kill(wrapperPid, "SIGTERM");
-        wrapperStopped = true;
-      } catch (error) {
-        wrapperStopped = false;
-      }
-    }
-
-    if (childPid && isPidAlive(childPid)) {
-      try {
-        process.kill(childPid, "SIGTERM");
-        childStopped = true;
-      } catch (error) {
-        childStopped = false;
-      }
-    }
+    const childPgid = status?.childPgid || meta?.childPgid || null;
 
     results.push({
       seatId,
-      childPid,
-      childStopped,
-      wrapperPid,
-      wrapperStopped,
+      ...stopTrackedSeat({
+        wrapperPid,
+        childPid,
+        childPgid,
+      }),
     });
   }
 
@@ -644,34 +700,6 @@ function listSessionNames() {
 async function stopSessions(sessionName = null) {
   const sessionNames = sessionName ? [sessionName] : listSessionNames();
   const sessionResults = sessionNames.map((name) => stopSession(name));
-
-  await sleep(200);
-
-  for (const sessionResult of sessionResults) {
-    for (const seat of sessionResult.seats) {
-      if (seat.wrapperPid && isPidAlive(seat.wrapperPid)) {
-        try {
-          process.kill(seat.wrapperPid, "SIGKILL");
-          seat.wrapperForced = true;
-        } catch (error) {
-          seat.wrapperForced = false;
-        }
-      } else {
-        seat.wrapperForced = false;
-      }
-
-      if (seat.childPid && isPidAlive(seat.childPid)) {
-        try {
-          process.kill(seat.childPid, "SIGKILL");
-          seat.childForced = true;
-        } catch (error) {
-          seat.childForced = false;
-        }
-      } else {
-        seat.childForced = false;
-      }
-    }
-  }
 
   return {
     sessionName,

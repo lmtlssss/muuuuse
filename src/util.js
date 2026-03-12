@@ -120,6 +120,68 @@ function readCommandVersion(command, args = ["--version"]) {
   return (result.stdout || result.stderr || "").trim().split("\n")[0] || null;
 }
 
+function listProcesses() {
+  const result = spawnSync("ps", ["-axo", "pid=,ppid=,pgid=,command="], {
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    return [];
+  }
+
+  return String(result.stdout || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const match = line.match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/);
+      if (!match) {
+        return null;
+      }
+
+      return {
+        pid: Number.parseInt(match[1], 10),
+        ppid: Number.parseInt(match[2], 10),
+        pgid: Number.parseInt(match[3], 10),
+        command: match[4],
+      };
+    })
+    .filter((entry) => entry !== null);
+}
+
+function getDescendantPids(rootPid) {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) {
+    return [];
+  }
+
+  const processes = listProcesses();
+  const descendants = [];
+  const queue = [rootPid];
+  const seen = new Set(queue);
+
+  while (queue.length > 0) {
+    const parentPid = queue.shift();
+    for (const process of processes) {
+      if (process.ppid !== parentPid || seen.has(process.pid)) {
+        continue;
+      }
+      seen.add(process.pid);
+      queue.push(process.pid);
+      descendants.push(process.pid);
+    }
+  }
+
+  return descendants;
+}
+
+function readProcessGroupId(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+
+  const match = listProcesses().find((entry) => entry.pid === pid);
+  return match ? match.pgid : null;
+}
+
 function stripAnsi(text) {
   return String(text || "").replace(
     // eslint-disable-next-line no-control-regex
@@ -288,15 +350,18 @@ module.exports = {
   commandExists,
   createId,
   ensureDir,
+  getDescendantPids,
   getDefaultSessionName,
   getFileSize,
+  getStateRoot,
   getSeatDir,
   getSeatPaths,
   getSessionDir,
-  getStateRoot,
   hashText,
   isPidAlive,
+  listProcesses,
   parseFlags,
+  readProcessGroupId,
   readAppendedText,
   readCommandVersion,
   readJson,
