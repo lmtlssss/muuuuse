@@ -1,6 +1,6 @@
 {
   "name": "muuuuse",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "🔌Muuuuse arms two regular terminals and relays final answers between them.",
   "type": "commonjs",
   "bin": {

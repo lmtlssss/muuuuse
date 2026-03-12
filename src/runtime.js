@@ -299,7 +299,10 @@ class ArmedSeat {
     this.child.onData((data) => {
       fs.appendFileSync(this.paths.pipePath, data);
       if (!this.stopped) {
-        process.stdout.write(data);
+        const visibleData = String(data).replace(/\u0007/g, "");
+        if (visibleData) {
+          process.stdout.write(visibleData);
+        }
       }
     });
 
@@ -731,6 +734,9 @@ class ArmedSeat {
     }
 
     if (this.child && !this.childExit) {
+      if (this.childPid && isPidAlive(this.childPid)) {
+        signalProcessFamily(this.childPid, "SIGKILL");
+      }
       try {
         this.child.kill();
       } catch {
@@ -848,9 +854,7 @@ function stopAllSessions() {
       if (seat.childLive) {
         signalProcessFamily(seat.childPid, "SIGHUP");
         signalProcessFamily(seat.childPid, "SIGTERM");
-        if (!seat.wrapperLive) {
-          signalProcessFamily(seat.childPid, "SIGKILL");
-        }
+        signalProcessFamily(seat.childPid, "SIGKILL");
       }
 
       if (seat.wrapperLive) {
@@ -886,12 +890,9 @@ function signalPid(pid, signal) {
 }
 
 function signalProcessTree(rootPid, signal) {
-  if (!Number.isInteger(rootPid) || rootPid <= 0) {
-    return 0;
-  }
-
+  const descendants = getChildProcesses(rootPid);
   let delivered = 0;
-  for (const process of getChildProcesses(rootPid)) {
+  for (const process of descendants) {
     if (signalPid(process.pid, signal)) {
       delivered += 1;
     }
@@ -904,26 +905,8 @@ function signalProcessTree(rootPid, signal) {
   return delivered;
 }
 
-function signalProcessGroup(rootPid, signal) {
-  if (!Number.isInteger(rootPid) || rootPid <= 0) {
-    return false;
-  }
-
-  try {
-    process.kill(-rootPid, signal);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function signalProcessFamily(rootPid, signal) {
-  let delivered = 0;
-  if (signalProcessGroup(rootPid, signal)) {
-    delivered += 1;
-  }
-  delivered += signalProcessTree(rootPid, signal);
-  return delivered;
+  return signalProcessTree(rootPid, signal);
 }
 
 function clearStaleStopRequest(stopPath, startedAtMs) {

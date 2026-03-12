@@ -389,7 +389,7 @@ async function testStopSilencesBellLoop() {
     await seat1.waitFor(/bell-loop-ready/);
     await sleep(250);
 
-    assert.match(seat1.getBuffer(), /\u0007/);
+    assert.doesNotMatch(seat1.getBuffer(), /\u0007/);
 
     const stopOutput = execFileSync(process.execPath, [binPath, "stop"], {
       encoding: "utf8",
@@ -403,8 +403,7 @@ async function testStopSilencesBellLoop() {
     await sleep(250);
 
     const afterStopDelta = seat1.getBuffer().slice(stopSnapshotLength);
-    const bellCountAfterStop = (afterStopDelta.match(/\u0007/g) || []).length;
-    assert.ok(bellCountAfterStop <= 1, `expected stop to silence the bell stream, saw ${bellCountAfterStop} bells after stop`);
+    assert.doesNotMatch(afterStopDelta, /\u0007/);
 
     const settledLength = seat1.getBuffer().length;
     await sleep(250);
