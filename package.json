@@ -1,6 +1,6 @@
 {
   "name": "muuuuse",
-  "version": "2.2.3",
+  "version": "2.2.4",
   "description": "🔌Muuuuse arms two regular terminals and relays assistant output between them.",
   "type": "commonjs",
   "bin": {

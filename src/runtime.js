@@ -932,6 +932,12 @@ class ArmedSeat {
     return Boolean(partner?.pid && isPidAlive(partner.pid));
   }
 
+  getPartnerFlowMode() {
+    const partnerStatus = readJson(this.partnerPaths.statusPath, null);
+    const partnerMeta = readJson(this.partnerPaths.metaPath, null);
+    return normalizeFlowMode(partnerStatus?.flowMode || partnerMeta?.flowMode || "off");
+  }
+
   stopRequested() {
     const request = readJson(this.sessionPaths.stopPath, null);
     if (!request?.requestedAt) {
@@ -1252,7 +1258,13 @@ class ArmedSeat {
     }
 
     const pendingInboundContext = this.getPendingInboundContext();
-    if (this.flowMode !== "on" && pendingInboundContext && pendingInboundContext.hop >= MAX_RELAY_CHAIN_HOP) {
+    const partnerFlowMode = this.getPartnerFlowMode();
+    if (
+      this.flowMode !== "on" &&
+      partnerFlowMode !== "on" &&
+      pendingInboundContext &&
+      pendingInboundContext.hop >= MAX_RELAY_CHAIN_HOP
+    ) {
       this.log(`[${this.seatId}] suppressed relay loop: ${previewText(payload)}`);
       return;
     }
