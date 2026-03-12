@@ -11,6 +11,7 @@ const startedAt = new Date().toISOString();
 const cwd = process.cwd();
 const replyMode = String(process.env.MOCK_REPLY_MODE || "prefix").trim().toLowerCase();
 let turn = 0;
+const keepaliveFds = [];
 
 const sessionFile = initializeSessionFile(agentType, cwd, startedAt);
 process.stdout.write(`${agentType}-ready\n`);
@@ -48,6 +49,7 @@ function initializeSessionFile(type, currentPath, timestamp) {
         timestamp,
       },
     })}\n`);
+    keepaliveFds.push(fs.openSync(filePath, "a"));
     return filePath;
   }
 
@@ -60,6 +62,7 @@ function initializeSessionFile(type, currentPath, timestamp) {
       timestamp,
       type: "bootstrap",
     })}\n`);
+    keepaliveFds.push(fs.openSync(filePath, "a"));
     return filePath;
   }
 
@@ -72,6 +75,7 @@ function initializeSessionFile(type, currentPath, timestamp) {
     projectHash: createHash("sha256").update(currentPath).digest("hex"),
     messages: [],
   }, null, 2));
+  keepaliveFds.push(fs.openSync(filePath, "a"));
   return filePath;
 }
 
@@ -123,3 +127,20 @@ function appendAnswer(type, filePath, reply) {
   });
   fs.writeFileSync(filePath, JSON.stringify(current, null, 2));
 }
+
+function closeKeepaliveFds() {
+  while (keepaliveFds.length > 0) {
+    const fd = keepaliveFds.pop();
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // best effort cleanup
+    }
+  }
+}
+
+process.on("exit", closeKeepaliveFds);
+process.on("SIGTERM", () => {
+  closeKeepaliveFds();
+  process.exit(0);
+});

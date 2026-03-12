@@ -5,6 +5,7 @@
 It does one job:
 - arm terminal one with `muuuuse 1`
 - arm terminal two with `muuuuse 2`
+- have seat 1 generate a session key and seat 2 sign it
 - watch Codex, Claude, or Gemini for real final answers
 - inject that final answer into the other armed terminal
 - keep looping until you stop it
@@ -32,7 +33,7 @@ Terminal 2:
 muuuuse 2
 ```
 
-Now both shells are armed. Use them normally.
+Now both shells are armed. `muuuuse 1` generates the session key, `muuuuse 2` signs it, and only that signed pair relays. Use those shells normally.
 
 If you want Codex in one and Gemini in the other, start them inside the armed shells:
 
@@ -62,6 +63,7 @@ muuuuse stop
 
 - no tmux
 - state lives under `~/.muuuuse`
+- only the signed armed pair can exchange relay events
 - supported final-answer detection is built for Codex, Claude, and Gemini
 - `codeman` remains the larger transport/control layer; `muuuuse` stays local and minimal
 

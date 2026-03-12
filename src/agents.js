@@ -128,6 +128,57 @@ function selectSessionCandidatePath(candidates, currentPath, processStartedAtMs)
   return null;
 }
 
+function listOpenFilePaths(pid, rootPath) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return [];
+  }
+
+  const fdRoot = `/proc/${pid}/fd`;
+  try {
+    const rootPrefix = path.resolve(rootPath);
+    const openPaths = fs.readdirSync(fdRoot)
+      .map((entry) => {
+        try {
+          return fs.realpathSync(path.join(fdRoot, entry));
+        } catch {
+          return null;
+        }
+      })
+      .filter((entry) => typeof entry === "string")
+      .filter((entry) => entry.startsWith(rootPrefix));
+
+    return [...new Set(openPaths)];
+  } catch {
+    return [];
+  }
+}
+
+function selectLiveSessionCandidatePath(candidates, currentPath, captureSinceMs = null) {
+  const cwdMatches = candidates.filter((candidate) => candidate.cwd === currentPath);
+  if (cwdMatches.length === 0) {
+    return null;
+  }
+
+  const primary = cwdMatches.some((candidate) => candidate.isSubagent === false)
+    ? cwdMatches.filter((candidate) => candidate.isSubagent === false)
+    : cwdMatches;
+
+  const recent = Number.isFinite(captureSinceMs)
+    ? primary.filter((candidate) => Number.isFinite(candidate.mtimeMs) && candidate.mtimeMs >= captureSinceMs - SESSION_START_EARLY_TOLERANCE_MS)
+    : primary;
+  const ranked = (recent.length > 0 ? recent : primary)
+    .slice()
+    .sort((left, right) => right.mtimeMs - left.mtimeMs || right.startedAtMs - left.startedAtMs);
+
+  return ranked[0]?.path || null;
+}
+
+function readOpenSessionCandidates(pid, rootPath, reader) {
+  return listOpenFilePaths(pid, rootPath)
+    .map((filePath) => reader(filePath))
+    .filter((candidate) => candidate !== null);
+}
+
 function readCodexCandidate(filePath) {
   try {
     const [firstLine] = readFirstLines(filePath, 1);
@@ -143,6 +194,7 @@ function readCodexCandidate(filePath) {
     return {
       path: filePath,
       cwd: entry.payload.cwd,
+      isSubagent: Boolean(entry.payload?.source?.subagent),
       startedAtMs: Date.parse(entry.payload.timestamp),
       mtimeMs: fs.statSync(filePath).mtimeMs,
     };
@@ -151,7 +203,13 @@ function readCodexCandidate(filePath) {
   }
 }
 
-function selectCodexSessionFile(currentPath, processStartedAtMs) {
+function selectCodexSessionFile(currentPath, processStartedAtMs, options = {}) {
+  const liveCandidates = readOpenSessionCandidates(options.pid, CODEX_ROOT, readCodexCandidate);
+  const livePath = selectLiveSessionCandidatePath(liveCandidates, currentPath, options.captureSinceMs);
+  if (livePath) {
+    return livePath;
+  }
+
   const candidates = walkFiles(CODEX_ROOT, (filePath) => filePath.endsWith(".jsonl"))
     .map((filePath) => readCodexCandidate(filePath))
     .filter((candidate) => candidate !== null);
@@ -252,7 +310,13 @@ function readClaudeCandidate(filePath) {
   }
 }
 
-function selectClaudeSessionFile(currentPath, processStartedAtMs) {
+function selectClaudeSessionFile(currentPath, processStartedAtMs, options = {}) {
+  const liveCandidates = readOpenSessionCandidates(options.pid, CLAUDE_ROOT, readClaudeCandidate);
+  const livePath = selectLiveSessionCandidatePath(liveCandidates, currentPath, options.captureSinceMs);
+  if (livePath) {
+    return livePath;
+  }
+
   const candidates = walkFiles(CLAUDE_ROOT, (filePath) => filePath.endsWith(".jsonl"))
     .map((filePath) => readClaudeCandidate(filePath))
     .filter((candidate) => candidate !== null);
@@ -331,8 +395,15 @@ function readGeminiCandidate(filePath) {
   }
 }
 
-function selectGeminiSessionFile(currentPath, processStartedAtMs) {
+function selectGeminiSessionFile(currentPath, processStartedAtMs, options = {}) {
   const projectHash = createHash("sha256").update(currentPath).digest("hex");
+  const liveCandidates = readOpenSessionCandidates(options.pid, GEMINI_ROOT, readGeminiCandidate)
+    .filter((candidate) => candidate.projectHash === projectHash);
+  const livePath = selectLiveSessionCandidatePath(liveCandidates, projectHash, options.captureSinceMs);
+  if (livePath) {
+    return livePath;
+  }
+
   const candidates = walkFiles(GEMINI_ROOT, (filePath) => filePath.endsWith(".json"))
     .map((filePath) => readGeminiCandidate(filePath))
     .filter((candidate) => candidate !== null && candidate.projectHash === projectHash);
@@ -384,6 +455,7 @@ module.exports = {
   readClaudeAnswers,
   readCodexAnswers,
   readGeminiAnswers,
+  selectLiveSessionCandidatePath,
   selectSessionCandidatePath,
   selectClaudeSessionFile,
   selectCodexSessionFile,

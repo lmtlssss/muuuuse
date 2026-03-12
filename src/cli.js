@@ -82,6 +82,9 @@ function renderSeatStatus(seat) {
   if (seat.partnerLive) {
     bits.push("peer live");
   }
+  if (seat.trust) {
+    bits.push(`trust ${seat.trust}`);
+  }
   if (seat.lastAnswerAt) {
     bits.push(`last answer ${seat.lastAnswerAt}`);
   }

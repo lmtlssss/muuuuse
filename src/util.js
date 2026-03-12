@@ -1,4 +1,10 @@
-const { createHash, randomBytes } = require("node:crypto");
+const {
+  createHash,
+  generateKeyPairSync,
+  randomBytes,
+  sign: cryptoSign,
+  verify: cryptoVerify,
+} = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -25,6 +31,13 @@ function writeJson(filePath, value) {
   ensureDir(path.dirname(filePath));
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`);
+  fs.renameSync(tempPath, filePath);
+}
+
+function writeSecret(filePath, value, mode = 0o600) {
+  ensureDir(path.dirname(filePath));
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tempPath, String(value), { mode });
   fs.renameSync(tempPath, filePath);
 }
 
@@ -161,13 +174,61 @@ function getSeatDir(sessionName, seatId) {
 function getSeatPaths(sessionName, seatId) {
   const dir = getSeatDir(sessionName, seatId);
   return {
+    ackPath: path.join(dir, "ack.json"),
+    challengePath: path.join(dir, "challenge.json"),
+    claimPath: path.join(dir, "claim.json"),
     dir,
     daemonPath: path.join(dir, "daemon.json"),
     eventsPath: path.join(dir, "events.jsonl"),
+    privateKeyPath: path.join(dir, "id_ed25519"),
+    publicKeyPath: path.join(dir, "id_ed25519.pub"),
     metaPath: path.join(dir, "meta.json"),
     pipePath: path.join(dir, "pipe.log"),
     statusPath: path.join(dir, "status.json"),
   };
+}
+
+function loadOrCreateSeatIdentity(paths) {
+  try {
+    const privateKey = fs.readFileSync(paths.privateKeyPath, "utf8").trim();
+    const publicKey = fs.readFileSync(paths.publicKeyPath, "utf8").trim();
+    if (privateKey && publicKey) {
+      return { privateKey, publicKey };
+    }
+  } catch {
+    // generate below
+  }
+
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const privateKeyPem = privateKey.export({ format: "pem", type: "pkcs8" });
+  const publicKeyPem = publicKey.export({ format: "pem", type: "spki" });
+  writeSecret(paths.privateKeyPath, privateKeyPem);
+  writeSecret(paths.publicKeyPath, publicKeyPem, 0o644);
+  return {
+    privateKey: String(privateKeyPem).trim(),
+    publicKey: String(publicKeyPem).trim(),
+  };
+}
+
+function signText(text, privateKey) {
+  return cryptoSign(null, Buffer.from(String(text || ""), "utf8"), privateKey).toString("base64");
+}
+
+function verifyText(text, signature, publicKey) {
+  if (!signature || !publicKey) {
+    return false;
+  }
+
+  try {
+    return cryptoVerify(
+      null,
+      Buffer.from(String(text || ""), "utf8"),
+      publicKey,
+      Buffer.from(String(signature || ""), "base64")
+    );
+  } catch {
+    return false;
+  }
 }
 
 function listSessionNames() {
@@ -195,9 +256,10 @@ function usage() {
     "Flow:",
     "  1. Run `muuuuse 1` in terminal one.",
     "  2. Run `muuuuse 2` in terminal two.",
-    "  3. Use those armed shells normally.",
-    "  4. Codex, Claude, and Gemini final answers relay automatically from their local session logs.",
-    "  5. Run `muuuuse status` or `muuuuse stop` from any shell.",
+    "  3. Seat 1 generates the session key and seat 2 signs it automatically.",
+    "  4. Use those armed shells normally.",
+    "  5. Codex, Claude, and Gemini final answers relay automatically from their local session logs.",
+    "  6. Run `muuuuse status` or `muuuuse stop` from any shell.",
     "",
     "Notes:",
     "  - No tmux.",
@@ -215,6 +277,7 @@ module.exports = {
   ensureDir,
   getDefaultSessionName,
   getFileSize,
+  loadOrCreateSeatIdentity,
   getSeatPaths,
   getSessionPaths,
   getStateRoot,
@@ -224,7 +287,10 @@ module.exports = {
   readAppendedText,
   readJson,
   sanitizeRelayText,
+  signText,
   sleep,
   usage,
+  verifyText,
   writeJson,
+  writeSecret,
 };

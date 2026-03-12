@@ -2,20 +2,20 @@
 
 const assert = require("node:assert/strict");
 const { createHash } = require("node:crypto");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const pty = require("node-pty");
 
 const {
-  detectAgent,
-  parseClaudeFinalLine,
-  parseCodexFinalLine,
-  readClaudeAnswers,
-  readCodexAnswers,
-  readGeminiAnswers,
-  selectSessionCandidatePath,
+    detectAgent,
+    parseClaudeFinalLine,
+    parseCodexFinalLine,
+    readClaudeAnswers,
+    readCodexAnswers,
+    readGeminiAnswers,
+    selectSessionCandidatePath,
 } = require("../src/agents");
 const { getDefaultSessionName } = require("../src/util");
 
@@ -33,8 +33,10 @@ async function main() {
   testLateAttachFiltering();
   testSessionCandidateSelection();
   testAgentDetection();
+  await testCodexPidBoundSessionSelection();
   testStatusWhenNothingIsArmed();
   await testRelayStatusStop();
+  await testForgedPartnerEventsAreIgnored();
   await testMirrorRepliesDoNotPingPong();
   await testStopSilencesBellLoop();
   process.stdout.write("muuuuse tests passed\n");
@@ -319,6 +321,95 @@ async function testRelayStatusStop() {
     env: buildEnv(home),
   });
   assert.match(statusOutput, /no armed seats found/i);
+}
+
+async function testCodexPidBoundSessionSelection() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-pid-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-pid-cwd-"));
+  const child = spawn(process.execPath, [fixturePath, "codex"], {
+    cwd,
+    env: buildEnv(home),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  try {
+    await waitForChildOutput(child, /codex-ready/);
+    const sessionFile = path.join(home, ".codex", "sessions", "mock", `mock-${child.pid}.jsonl`);
+    const siblingPath = path.join(home, ".codex", "sessions", "mock", "sibling.jsonl");
+    fs.mkdirSync(path.dirname(siblingPath), { recursive: true });
+    fs.writeFileSync(siblingPath, `${JSON.stringify({
+      type: "session_meta",
+      payload: {
+        cwd,
+        timestamp: new Date().toISOString(),
+      },
+    })}\n`);
+
+    const selected = execFileSync(process.execPath, [
+      "-e",
+      `
+        const { selectCodexSessionFile } = require(${JSON.stringify(path.join(__dirname, "..", "src", "agents.js"))});
+        const selected = selectCodexSessionFile(${JSON.stringify(cwd)}, ${Date.now()}, {
+          pid: ${child.pid},
+          captureSinceMs: ${Date.now() - 1000},
+        });
+        process.stdout.write(selected || "");
+      `,
+    ], {
+      encoding: "utf8",
+      env: buildEnv(home),
+    }).trim() || null;
+    assert.equal(selected, sessionFile);
+  } finally {
+    child.kill("SIGTERM");
+    await waitForChildExit(child);
+  }
+}
+
+async function testForgedPartnerEventsAreIgnored() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-signed-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-signed-cwd-"));
+  const sessionName = getDefaultSessionName(cwd);
+  const seat1 = spawnSeat(1, { cwd, home });
+  const seat2 = spawnSeat(2, { cwd, home });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+
+    seat1.write(`${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+
+    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
+
+    const forgedEventsPath = path.join(home, ".muuuuse", "sessions", sessionName, "seat-2", "events.jsonl");
+    fs.appendFileSync(forgedEventsPath, `${JSON.stringify({
+      id: "forged-answer",
+      type: "answer",
+      seatId: 2,
+      origin: "gemini",
+      text: "FORGED",
+      createdAt: new Date().toISOString(),
+      challenge: "wrong",
+      publicKey: "not-a-real-key",
+      signature: "not-a-real-signature",
+    })}\n`);
+
+    await sleep(500);
+    assert.doesNotMatch(seat1.getBuffer(), /FORGED/);
+
+    seat2.write("alive\r");
+    await seat2.waitFor(/gemini turn 1: alive/);
+    await seat1.waitFor(/gemini turn 1: alive/);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
 }
 
 async function testMirrorRepliesDoNotPingPong() {
@@ -645,6 +736,31 @@ function shellQuote(value) {
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function waitForChildOutput(child, pattern, timeoutMs = 5000) {
+  let buffer = "";
+  const onData = (chunk) => {
+    buffer += chunk.toString("utf8");
+  };
+  child.stdout.on("data", onData);
+
+  try {
+    await waitForBuffer(() => buffer, pattern, timeoutMs, "child stdout");
+  } finally {
+    child.stdout.off("data", onData);
+  }
+}
+
+async function waitForChildExit(child, timeoutMs = 5000) {
+  if (child.exitCode !== null) {
+    return child.exitCode;
+  }
+
+  await waitForPromise(new Promise((resolve) => {
+    child.once("exit", resolve);
+  }), timeoutMs, "child exit");
+  return child.exitCode;
 }
 
 main().catch((error) => {

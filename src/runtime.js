@@ -23,11 +23,14 @@ const {
   getSessionPaths,
   hashText,
   isPidAlive,
+  loadOrCreateSeatIdentity,
   listSessionNames,
   readAppendedText,
   readJson,
   sanitizeRelayText,
+  signText,
   sleep,
+  verifyText,
   writeJson,
 } = require("./util");
 
@@ -142,21 +145,77 @@ function getChildProcesses(rootPid) {
   }
 }
 
-function resolveSessionFile(agentType, currentPath, processStartedAtMs) {
+function resolveSessionFile(agentType, agentPid, currentPath, captureSinceMs, processStartedAtMs) {
   if (!currentPath) {
     return null;
   }
 
+  const options = {
+    pid: agentPid,
+    captureSinceMs,
+  };
+
   if (agentType === "codex") {
-    return selectCodexSessionFile(currentPath, processStartedAtMs);
+    return selectCodexSessionFile(currentPath, processStartedAtMs, options);
   }
   if (agentType === "claude") {
-    return selectClaudeSessionFile(currentPath, processStartedAtMs);
+    return selectClaudeSessionFile(currentPath, processStartedAtMs, options);
   }
   if (agentType === "gemini") {
-    return selectGeminiSessionFile(currentPath, processStartedAtMs);
+    return selectGeminiSessionFile(currentPath, processStartedAtMs, options);
   }
   return null;
+}
+
+function buildClaimMessage(sessionName, challenge, seat1PublicKey, seat2PublicKey) {
+  return JSON.stringify({
+    type: "muuuuse_pair_claim",
+    sessionName,
+    challenge,
+    seat1PublicKey,
+    seat2PublicKey,
+  });
+}
+
+function buildAckMessage(sessionName, challenge, seat1PublicKey, seat2PublicKey) {
+  return JSON.stringify({
+    type: "muuuuse_pair_ack",
+    sessionName,
+    challenge,
+    seat1PublicKey,
+    seat2PublicKey,
+  });
+}
+
+function buildAnswerSignaturePayload(sessionName, challenge, entry) {
+  return JSON.stringify({
+    type: "muuuuse_answer",
+    sessionName,
+    challenge,
+    id: entry.id,
+    seatId: entry.seatId,
+    origin: entry.origin,
+    createdAt: entry.createdAt,
+    text: entry.text,
+  });
+}
+
+function readSeatChallenge(paths, sessionName) {
+  const record = readJson(paths.challengePath, null);
+  if (
+    !record ||
+    record.sessionName !== sessionName ||
+    typeof record.challenge !== "string" ||
+    typeof record.publicKey !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    challenge: record.challenge,
+    publicKey: record.publicKey.trim(),
+    createdAt: record.createdAt || null,
+  };
 }
 
 async function sendTextAndEnter(child, text, shouldAbort = () => false) {
@@ -226,7 +285,14 @@ class ArmedSeat {
     this.stdinCleanup = null;
     this.resizeCleanup = null;
     this.forceKillTimer = null;
+    this.identity = null;
     this.recentInboundRelays = [];
+    this.trustState = {
+      challenge: null,
+      peerPublicKey: null,
+      phase: this.seatId === 1 ? "waiting_for_peer_signature" : "waiting_for_seat1_key",
+      pairedAt: null,
+    };
     this.liveState = {
       type: null,
       pid: null,
@@ -272,10 +338,177 @@ class ArmedSeat {
     });
   }
 
+  initializeTrustMaterial() {
+    this.identity = loadOrCreateSeatIdentity(this.paths);
+
+    if (this.seatId !== 1) {
+      return;
+    }
+
+    writeJson(this.paths.challengePath, {
+      sessionName: this.sessionName,
+      challenge: createId(48),
+      publicKey: this.identity.publicKey,
+      createdAt: new Date().toISOString(),
+    });
+    this.trustState.challenge = readSeatChallenge(this.paths, this.sessionName)?.challenge || null;
+    this.trustState.peerPublicKey = null;
+    this.trustState.phase = "waiting_for_peer_signature";
+    this.trustState.pairedAt = null;
+    fs.rmSync(this.paths.ackPath, { force: true });
+    fs.rmSync(this.partnerPaths.claimPath, { force: true });
+  }
+
+  syncTrustState() {
+    if (!this.identity) {
+      this.initializeTrustMaterial();
+    }
+
+    if (this.seatId === 1) {
+      this.syncSeatOneTrust();
+      return;
+    }
+
+    this.syncSeatTwoTrust();
+  }
+
+  syncSeatOneTrust() {
+    const challengeRecord = readSeatChallenge(this.paths, this.sessionName);
+    if (!challengeRecord || challengeRecord.publicKey !== this.identity.publicKey) {
+      this.trustState = {
+        challenge: null,
+        peerPublicKey: null,
+        phase: "waiting_for_peer_signature",
+        pairedAt: null,
+      };
+      return;
+    }
+
+    this.trustState.challenge = challengeRecord.challenge;
+    const claim = readJson(this.partnerPaths.claimPath, null);
+    if (
+      !claim ||
+      claim.sessionName !== this.sessionName ||
+      claim.challenge !== challengeRecord.challenge ||
+      typeof claim.publicKey !== "string" ||
+      typeof claim.signature !== "string" ||
+      !verifyText(
+        buildClaimMessage(
+          this.sessionName,
+          challengeRecord.challenge,
+          this.identity.publicKey,
+          claim.publicKey.trim()
+        ),
+        claim.signature,
+        claim.publicKey
+      )
+    ) {
+      this.trustState.peerPublicKey = null;
+      this.trustState.phase = "waiting_for_peer_signature";
+      this.trustState.pairedAt = null;
+      fs.rmSync(this.paths.ackPath, { force: true });
+      return;
+    }
+
+    const peerPublicKey = claim.publicKey.trim();
+    const ackMessage = buildAckMessage(this.sessionName, challengeRecord.challenge, this.identity.publicKey, peerPublicKey);
+    const currentAck = readJson(this.paths.ackPath, null);
+    const ackIsValid = Boolean(
+      currentAck &&
+      currentAck.sessionName === this.sessionName &&
+      currentAck.challenge === challengeRecord.challenge &&
+      currentAck.publicKey === this.identity.publicKey &&
+      currentAck.peerPublicKey === peerPublicKey &&
+      typeof currentAck.signature === "string" &&
+      verifyText(ackMessage, currentAck.signature, this.identity.publicKey)
+    );
+    if (!ackIsValid) {
+      writeJson(this.paths.ackPath, {
+        sessionName: this.sessionName,
+        challenge: challengeRecord.challenge,
+        publicKey: this.identity.publicKey,
+        peerPublicKey,
+        signature: signText(ackMessage, this.identity.privateKey),
+        signedAt: new Date().toISOString(),
+      });
+    }
+
+    const ackRecord = ackIsValid ? currentAck : readJson(this.paths.ackPath, null);
+    this.trustState.peerPublicKey = peerPublicKey;
+    this.trustState.phase = "paired";
+    this.trustState.pairedAt = ackRecord?.signedAt || new Date().toISOString();
+  }
+
+  syncSeatTwoTrust() {
+    const challengeRecord = readSeatChallenge(this.partnerPaths, this.sessionName);
+    if (!challengeRecord) {
+      this.trustState = {
+        challenge: null,
+        peerPublicKey: null,
+        phase: "waiting_for_seat1_key",
+        pairedAt: null,
+      };
+      return;
+    }
+
+    const challenge = challengeRecord.challenge;
+    const peerPublicKey = challengeRecord.publicKey;
+    const claimPayload = {
+      sessionName: this.sessionName,
+      challenge,
+      publicKey: this.identity.publicKey,
+    };
+    const claimSignature = signText(
+      buildClaimMessage(this.sessionName, challenge, peerPublicKey, this.identity.publicKey),
+      this.identity.privateKey
+    );
+    const currentClaim = readJson(this.paths.claimPath, null);
+    if (
+      !currentClaim ||
+      currentClaim.sessionName !== claimPayload.sessionName ||
+      currentClaim.challenge !== claimPayload.challenge ||
+      currentClaim.publicKey !== claimPayload.publicKey ||
+      currentClaim.signature !== claimSignature
+    ) {
+      writeJson(this.paths.claimPath, {
+        ...claimPayload,
+        signature: claimSignature,
+        signedAt: new Date().toISOString(),
+      });
+    }
+
+    const ack = readJson(this.partnerPaths.ackPath, null);
+    const paired = Boolean(
+      ack &&
+      ack.sessionName === this.sessionName &&
+      ack.challenge === challenge &&
+      ack.peerPublicKey === this.identity.publicKey &&
+      ack.publicKey === peerPublicKey &&
+      typeof ack.signature === "string" &&
+      verifyText(
+        buildAckMessage(this.sessionName, challenge, peerPublicKey, this.identity.publicKey),
+        ack.signature,
+        peerPublicKey
+      )
+    );
+
+    this.trustState.challenge = challenge;
+    this.trustState.peerPublicKey = peerPublicKey;
+    this.trustState.phase = paired ? "paired" : "waiting_for_pair_ack";
+    this.trustState.pairedAt = paired ? (ack.signedAt || new Date().toISOString()) : null;
+  }
+
+  isPaired() {
+    return this.trustState.phase === "paired" &&
+      typeof this.trustState.challenge === "string" &&
+      typeof this.trustState.peerPublicKey === "string";
+  }
+
   launchShell() {
     ensureDir(this.paths.dir);
     fs.rmSync(this.paths.pipePath, { force: true });
     clearStaleStopRequest(this.sessionPaths.stopPath, this.startedAtMs);
+    this.initializeTrustMaterial();
 
     const shell = resolveShell();
     const shellArgs = resolveShellArgs(shell);
@@ -294,7 +527,7 @@ class ArmedSeat {
 
     this.childPid = this.child.pid;
     this.writeMeta();
-    this.writeStatus({ state: "running" });
+    this.writeStatus({ state: "running", trust: this.trustState.phase });
 
     this.child.onData((data) => {
       fs.appendFileSync(this.paths.pipePath, data);
@@ -441,7 +674,7 @@ class ArmedSeat {
   async pullPartnerEvents() {
     const { nextOffset, text } = readAppendedText(this.partnerPaths.eventsPath, this.partnerOffset);
     this.partnerOffset = nextOffset;
-    if (!text.trim() || !this.child || this.stopped) {
+    if (!text.trim() || !this.child || this.stopped || !this.isPaired()) {
       return;
     }
 
@@ -453,7 +686,20 @@ class ArmedSeat {
       }
 
       const payload = sanitizeRelayText(entry.text);
-      if (!payload) {
+      const signaturePayload = buildAnswerSignaturePayload(this.sessionName, this.trustState.challenge, {
+        id: entry.id,
+        seatId: entry.seatId,
+        origin: entry.origin || "unknown",
+        createdAt: entry.createdAt,
+        text: payload,
+      });
+      if (
+        !payload ||
+        entry.challenge !== this.trustState.challenge ||
+        entry.publicKey !== this.trustState.peerPublicKey ||
+        typeof entry.signature !== "string" ||
+        !verifyText(signaturePayload, entry.signature, this.trustState.peerPublicKey)
+      ) {
         continue;
       }
 
@@ -570,7 +816,9 @@ class ArmedSeat {
     if (!this.liveState.sessionFile) {
       this.liveState.sessionFile = resolveSessionFile(
         detectedAgent.type,
+        detectedAgent.pid,
         currentPath,
+        this.liveState.captureSinceMs,
         detectedAgent.processStartedAtMs
       );
 
@@ -643,7 +891,7 @@ class ArmedSeat {
     }
 
     const payload = sanitizeRelayText(entry.text);
-    if (!payload) {
+    if (!payload || !this.identity || !this.trustState.challenge) {
       return;
     }
 
@@ -653,14 +901,21 @@ class ArmedSeat {
       return;
     }
 
-    appendJsonl(this.paths.eventsPath, {
+    const signedEntry = {
       id: entry.id || createId(12),
       type: "answer",
       seatId: this.seatId,
       origin: entry.origin || "unknown",
       text: payload,
       createdAt: entry.createdAt || new Date().toISOString(),
-    });
+      challenge: this.trustState.challenge,
+      publicKey: this.identity.publicKey,
+    };
+    signedEntry.signature = signText(
+      buildAnswerSignaturePayload(this.sessionName, this.trustState.challenge, signedEntry),
+      this.identity.privateKey
+    );
+    appendJsonl(this.paths.eventsPath, signedEntry);
 
     this.log(`[${this.seatId}] ${previewText(payload)}`);
   }
@@ -670,11 +925,13 @@ class ArmedSeat {
       this.writeStatus({
         state: "stopping",
         partnerLive: this.partnerIsLive(),
+        trust: this.trustState.phase,
       });
       this.requestStop("stop_requested");
       return;
     }
 
+    this.syncTrustState();
     await this.pullPartnerEvents();
     if (this.stopped || this.stopRequested()) {
       this.requestStop("stop_requested");
@@ -693,6 +950,8 @@ class ArmedSeat {
       log: live.log,
       lastAnswerAt: live.lastAnswerAt,
       partnerLive: this.partnerIsLive(),
+      trust: this.trustState.phase,
+      challengeReady: Boolean(this.trustState.challenge),
     });
   }
 
@@ -704,6 +963,11 @@ class ArmedSeat {
 
     this.log(`${BRAND} seat ${this.seatId} armed for ${this.sessionName}.`);
     this.log("Use this shell normally. Codex, Claude, and Gemini final answers relay automatically from their local session logs.");
+    if (this.seatId === 1) {
+      this.log("Seat 1 generated the session key and is waiting for seat 2 to sign it.");
+    } else {
+      this.log("Seat 2 will sign the session key from seat 1, then relay goes live.");
+    }
     this.log("Run `muuuuse status` or `muuuuse stop` from any terminal.");
 
     try {
@@ -797,6 +1061,7 @@ function buildSeatReport(sessionName, seatId) {
     relayCount: status?.relayCount || 0,
     log: status?.log || null,
     startedAt: meta?.startedAt || null,
+    trust: status?.trust || null,
     updatedAt: status?.updatedAt || null,
     lastAnswerAt: status?.lastAnswerAt || null,
     partnerLive: Boolean(status?.partnerLive),
