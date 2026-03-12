@@ -1,26 +1,62 @@
 # 🔌Muuuuse
 
-`muuuuse` installs one CLI:
+`🔌Muuuuse` is a dead-simple terminal relay.
 
-- `muuuuse`
+It does one thing:
+- arm two raw terminals
+- watch for the final BEL-marked message from whatever program is running inside them
+- inject that final message into the other armed terminal
+- keep bouncing forever until you stop it
 
-The public brand stays `🔌Muuuuse`. The terminal command stays `muuuuse`.
-
-## What It Is Now
-
-`🔌Muuuuse` no longer expects you to arm a terminal first and launch something later.
-
-The main flow is:
+There are only three commands:
 
 ```bash
-muuuuse 1 <program...>
-muuuuse 2 <program...>
+muuuuse 1
+muuuuse 2
 muuuuse stop
 ```
 
-Seat `1` and seat `2` each launch and own a real local program under a PTY wrapper. Once both seats are alive in the same lane, they automatically bounce final blocks between each other by typing the partner answer plus `Enter` into the wrapped program.
+No tmux.
+No program arguments.
+No status command.
+No doctor command.
+No preset logic.
 
-`muuuuse stop` is the real cleanup command. With no flags it force-stops every tracked lane. Use `--session <name>` if you only want one explicit lane.
+## Flow
+
+Shell 1:
+
+```bash
+muuuuse 1
+```
+
+Shell 2:
+
+```bash
+muuuuse 2
+```
+
+Now both shells are armed. Use them normally.
+
+If you want Codex in one and Gemini in the other, start them inside the armed shells:
+
+```bash
+codex
+```
+
+```bash
+gemini
+```
+
+Or run any other program. `🔌Muuuuse` is program-agnostic.
+
+When the running program rings the terminal bell, `🔌Muuuuse` takes the final output block for that turn and injects it into the partner seat.
+
+Stop the whole loop from any other shell:
+
+```bash
+muuuuse stop
+```
 
 ## Install
 
@@ -28,78 +64,22 @@ Seat `1` and seat `2` each launch and own a real local program under a PTY wrapp
 npm install -g muuuuse
 ```
 
-## Fastest AI Flow
+## What Counts As A Relay
 
-Terminal 1:
+`🔌Muuuuse` watches the armed terminal output for BEL (`\u0007`).
 
-```bash
-muuuuse 1 codex
-```
+That BEL marks the end of a turn.
 
-Terminal 2:
-
-```bash
-muuuuse 2 gemini
-```
-
-Terminal 3:
-
-```bash
-muuuuse stop
-```
-
-Known presets expand to recommended flags automatically:
-
-- `codex`
-- `claude`
-- `gemini`
-
-So `muuuuse 1 codex` launches the fuller Codex command, not just bare `codex`.
-
-## Generic Program Flow
-
-This is not AI-only. Any local program can be wrapped directly.
-
-Example:
-
-```bash
-muuuuse 1 bash -lc 'while read line; do printf "left: %s\n\n" "$line"; done'
-muuuuse 2 bash -lc 'while read line; do printf "right: %s\n\n" "$line"; done'
-```
-
-Type into one seat and the other seat will receive the relayed block.
-
-For Codex, Claude, and Gemini, `🔌Muuuuse` waits for their structured final-answer logs instead of relaying transient screen chatter. For anything else, it first looks for an explicit `(answer)` block and otherwise falls back to the last stable output block after a turn goes idle.
-
-## Sessions
-
-Seats auto-pair by current working directory by default.
-
-If you want an explicit lane name, use:
-
-```bash
-muuuuse 1 --session demo codex
-muuuuse 2 --session demo gemini
-muuuuse stop --session demo
-```
-
-You can also inspect the lane:
-
-```bash
-muuuuse status
-```
-
-## Doctor
-
-```bash
-muuuuse doctor
-```
-
-This checks the local runtime plus common agent binaries if you use them.
+When it sees BEL, it:
+1. grabs the final output block since the last submitted input
+2. cleans the block
+3. appends it to the seat event log
+4. injects it into the other armed terminal followed by Enter
 
 ## Notes
 
 - local only
-- no tmux requirement for the main path
-- no remote control surface here; that belongs to `codeman`
-- best with programs that naturally produce turn-shaped output
+- seat pairing defaults by current working directory
+- state lives under `~/.muuuuse`
+- `codeman` remains the richer transport layer
+- `🔌Muuuuse` is the tiny relay protocol

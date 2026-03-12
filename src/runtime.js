@@ -3,152 +3,102 @@ const path = require("node:path");
 const pty = require("node-pty");
 
 const {
-  detectAgentTypeFromCommand,
-  expandPresetCommand,
-  readClaudeAnswers,
-  readCodexAnswers,
-  readGeminiAnswers,
-  selectClaudeSessionFile,
-  selectCodexSessionFile,
-  selectGeminiSessionFile,
-} = require("./agents");
-const {
   BRAND,
   POLL_MS,
   appendJsonl,
   createId,
-  getDescendantPids,
+  ensureDir,
   getDefaultSessionName,
   getFileSize,
   getSeatPaths,
   getStateRoot,
   hashText,
   isPidAlive,
-  readProcessGroupId,
+  listSessionNames,
   readAppendedText,
   readJson,
-  resetDir,
   sanitizeRelayText,
   sleep,
   writeJson,
 } = require("./util");
 
-const GENERIC_IDLE_MS = 900;
+const BELL = "\u0007";
+const CTRL_C = "\u0003";
 
-function resolveSessionName(sessionOverride, currentPath = process.cwd()) {
-  return sessionOverride || getDefaultSessionName(currentPath);
+function resolveShell() {
+  const shell = String(process.env.SHELL || "").trim();
+  return shell || "/bin/bash";
 }
 
-function resolveProgramTokens(commandTokens, usePresets = true) {
-  const resolved = expandPresetCommand(commandTokens, usePresets);
-  if (resolved.length === 0) {
-    throw new Error("Seat commands now require a program. Example: `muuuuse 1 codex`.");
+function resolveShellArgs(shellPath) {
+  const base = path.basename(shellPath);
+  if (base === "bash" || base === "zsh") {
+    return ["-l"];
   }
-  return resolved;
+  return [];
 }
 
-function formatCommand(commandTokens) {
-  return commandTokens
-    .map((token) => {
-      if (/^[a-zA-Z0-9._/@:=+-]+$/.test(token)) {
-        return token;
-      }
-      return JSON.stringify(token);
-    })
-    .join(" ");
-}
-
-function previewText(text, maxLength = 88) {
-  const compact = sanitizeRelayText(text).replace(/\s+/g, " ");
-  if (compact.length <= maxLength) {
-    return compact;
+function resolveChildTerm() {
+  const inherited = String(process.env.TERM || "").trim();
+  if (inherited && inherited.toLowerCase() !== "dumb") {
+    return inherited;
   }
-  return `${compact.slice(0, maxLength - 3)}...`;
+  return "xterm-256color";
 }
 
-function parseAnswerEntries(text) {
-  return String(text || "")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line) => {
-      try {
-        return JSON.parse(line);
-      } catch (error) {
-        return null;
-      }
-    })
-    .filter((entry) => entry && entry.type === "answer" && typeof entry.text === "string");
+function resolveSessionName(currentPath = process.cwd()) {
+  return getDefaultSessionName(currentPath);
 }
 
-function resolveSessionFile(agentType, currentPath, processStartedAtMs, options = {}) {
-  if (agentType === "codex") {
-    return selectCodexSessionFile(currentPath, processStartedAtMs, options);
-  }
-  if (agentType === "claude") {
-    return selectClaudeSessionFile(currentPath, processStartedAtMs);
-  }
-  if (agentType === "gemini") {
-    return selectGeminiSessionFile(currentPath, processStartedAtMs);
-  }
-  return null;
-}
-
-class GenericAnswerTracker {
+class BellRelayTracker {
   constructor() {
     this.active = false;
     this.buffer = "";
     this.lastInputText = "";
-    this.lastOutputAt = 0;
     this.lastFingerprint = null;
   }
 
   noteTurnStart(inputText = "") {
     this.active = true;
     this.buffer = "";
-    this.lastInputText = sanitizeRelayText(inputText);
-    this.lastOutputAt = 0;
+    this.lastInputText = sanitizeRelayText(inputText, 12000);
   }
 
   append(data) {
-    if (!this.active) {
-      return;
+    const text = String(data || "");
+    if (!text || !this.active) {
+      return [];
     }
 
-    this.buffer += String(data || "");
-    this.lastOutputAt = Date.now();
+    const answers = [];
+    for (const char of text) {
+      if (char === BELL) {
+        const answer = extractFinalBlock(this.buffer, this.lastInputText);
+        this.buffer = "";
+        this.active = false;
+        if (!answer) {
+          continue;
+        }
+        const fingerprint = hashText(`${this.lastInputText}\n${answer}`);
+        if (fingerprint === this.lastFingerprint) {
+          continue;
+        }
+        this.lastFingerprint = fingerprint;
+        answers.push(answer);
+        continue;
+      }
 
-    if (this.buffer.length > 24000) {
-      this.buffer = this.buffer.slice(-24000);
-    }
-  }
-
-  consumeReady() {
-    if (!this.active || !this.lastOutputAt) {
-      return null;
-    }
-
-    if (Date.now() - this.lastOutputAt < GENERIC_IDLE_MS) {
-      return null;
-    }
-
-    const text = extractGenericAnswer(this.buffer, this.lastInputText);
-    if (!text) {
-      return null;
-    }
-
-    const fingerprint = hashText(`${this.lastInputText}\n${text}`);
-    if (fingerprint === this.lastFingerprint) {
-      return null;
+      this.buffer += char;
+      if (this.buffer.length > 24000) {
+        this.buffer = this.buffer.slice(-24000);
+      }
     }
 
-    this.lastFingerprint = fingerprint;
-    this.active = false;
-    return text;
+    return answers;
   }
 }
 
-function extractGenericAnswer(rawText, lastInputText) {
+function extractFinalBlock(rawText, lastInputText) {
   let candidate = sanitizeRelayText(rawText, 12000);
   if (!candidate) {
     return null;
@@ -163,15 +113,10 @@ function extractGenericAnswer(rawText, lastInputText) {
     }
   }
 
-  const markerAnswer = extractMarkedAnswer(candidate);
-  if (markerAnswer) {
-    return markerAnswer;
-  }
-
   const blocks = candidate
     .split(/\n{2,}/)
     .map((block) => block.trim())
-    .filter((block) => block.length > 0);
+    .filter(Boolean);
 
   if (blocks.length === 0) {
     return null;
@@ -180,28 +125,27 @@ function extractGenericAnswer(rawText, lastInputText) {
   return sanitizeRelayText(blocks[blocks.length - 1]);
 }
 
-function extractMarkedAnswer(content) {
-  const lines = String(content || "").split("\n");
-  const answerIndex = lines.findIndex((line) => line.trim().startsWith("(answer)"));
-  if (answerIndex === -1) {
-    return null;
-  }
-
-  const answerLines = lines.slice(answerIndex);
-  answerLines[0] = answerLines[0].trim().replace(/^\(answer\)\s*/, "");
-  return sanitizeRelayText(answerLines.join("\n"));
+function parseAnswerEntries(text) {
+  return String(text || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry) => entry && entry.type === "answer" && typeof entry.text === "string");
 }
 
-class SeatProcess {
+class ArmedSeat {
   constructor(options) {
     this.seatId = options.seatId;
     this.partnerSeatId = options.seatId === 1 ? 2 : 1;
-    this.sessionName = options.sessionName;
     this.cwd = options.cwd;
-    this.commandTokens = [...options.commandTokens];
-    this.agentType = detectAgentTypeFromCommand(this.commandTokens);
-    this.maxRelays = options.maxRelays;
-
+    this.sessionName = resolveSessionName(this.cwd);
     this.paths = getSeatPaths(this.sessionName, this.seatId);
     this.partnerPaths = getSeatPaths(this.sessionName, this.partnerSeatId);
     this.partnerOffset = getFileSize(this.partnerPaths.eventsPath);
@@ -210,22 +154,13 @@ class SeatProcess {
     this.childPid = null;
     this.childPgid = null;
     this.childExit = null;
-    this.startedAtMs = Date.now();
+    this.startedAt = new Date().toISOString();
     this.relayCount = 0;
-    this.linked = false;
+    this.pendingInput = "";
     this.stopped = false;
     this.stdinCleanup = null;
     this.resizeCleanup = null;
-    this.childToken = createId(16);
-    this.processStartedAtMs = null;
-
-    this.sessionState = {
-      file: null,
-      offset: 0,
-      lastMessageId: null,
-    };
-
-    this.genericTracker = new GenericAnswerTracker();
+    this.tracker = new BellRelayTracker();
   }
 
   log(message) {
@@ -235,16 +170,13 @@ class SeatProcess {
   writeMeta(extra = {}) {
     writeJson(this.paths.metaPath, {
       seatId: this.seatId,
+      partnerSeatId: this.partnerSeatId,
       sessionName: this.sessionName,
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
-      childPgid: this.childPgid,
-      childToken: this.childToken,
-      agentType: this.agentType,
-      command: this.commandTokens,
-      commandLine: formatCommand(this.commandTokens),
-      startedAt: new Date(this.startedAtMs).toISOString(),
+      command: [resolveShell(), ...resolveShellArgs(resolveShell())],
+      startedAt: this.startedAt,
       ...extra,
     });
   }
@@ -252,27 +184,54 @@ class SeatProcess {
   writeStatus(extra = {}) {
     writeJson(this.paths.statusPath, {
       seatId: this.seatId,
+      partnerSeatId: this.partnerSeatId,
       sessionName: this.sessionName,
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
-      childPgid: this.childPgid,
-      childToken: this.childToken,
-      agentType: this.agentType,
-      command: this.commandTokens,
       relayCount: this.relayCount,
       updatedAt: new Date().toISOString(),
       ...extra,
     });
   }
 
-  installSignalHandlers() {
-    const stop = () => {
+  launchShell() {
+    ensureDir(this.paths.dir);
+    fs.rmSync(this.paths.pipePath, { force: true });
+
+    const shell = resolveShell();
+    const shellArgs = resolveShellArgs(shell);
+    this.child = pty.spawn(shell, shellArgs, {
+      cols: process.stdout.columns || 120,
+      rows: process.stdout.rows || 36,
+      cwd: this.cwd,
+      env: {
+        ...process.env,
+        TERM: resolveChildTerm(),
+        MUUUUSE_SEAT: String(this.seatId),
+        MUUUUSE_SESSION: this.sessionName,
+      },
+      name: resolveChildTerm(),
+    });
+
+    this.childPid = this.child.pid;
+    this.childPgid = this.child.pid;
+    this.writeMeta();
+    this.writeStatus({ state: "running" });
+
+    this.child.onData((data) => {
+      fs.appendFileSync(this.paths.pipePath, data);
+      process.stdout.write(data);
+      const answers = this.tracker.append(data);
+      for (const answer of answers) {
+        this.emitAnswer(answer);
+      }
+    });
+
+    this.child.onExit(({ exitCode, signal }) => {
+      this.childExit = { exitCode, signal: signal || null };
       this.stopped = true;
-    };
-    process.once("SIGINT", stop);
-    process.once("SIGHUP", stop);
-    process.once("SIGTERM", stop);
+    });
   }
 
   installStdinProxy() {
@@ -283,10 +242,9 @@ class SeatProcess {
 
       const text = chunk.toString("utf8");
       this.child.write(text);
-      if (this.shouldUseGenericCapture() && /[\r\n]/.test(text)) {
-        this.genericTracker.noteTurnStart("");
-      }
+      this.trackInput(text);
     };
+
     const handleEnd = () => {
       this.stopped = true;
     };
@@ -320,9 +278,9 @@ class SeatProcess {
       }
 
       try {
-        this.child.resize(process.stdout.columns || 80, process.stdout.rows || 24);
-      } catch (error) {
-        // Ignore resize failures while the child is exiting.
+        this.child.resize(process.stdout.columns || 120, process.stdout.rows || 36);
+      } catch {
+        // Ignore resize races while the child is exiting.
       }
     };
 
@@ -332,64 +290,40 @@ class SeatProcess {
     };
   }
 
-  launchChild() {
-    resetDir(this.paths.dir);
-
-    const [file, ...args] = this.commandTokens;
-    this.child = pty.spawn(file, args, {
-      cols: process.stdout.columns || 80,
-      cwd: this.cwd,
-      env: {
-        ...process.env,
-        MUUUUSE_CHILD_TOKEN: this.childToken,
-        MUUUUSE_SEAT: String(this.seatId),
-        MUUUUSE_SESSION: this.sessionName,
-      },
-      name: process.env.TERM || "xterm-256color",
-      rows: process.stdout.rows || 24,
-    });
-
-    this.childPid = this.child.pid;
-    this.childPgid = readProcessGroupId(this.childPid) || this.childPid;
-    this.processStartedAtMs = Date.now();
-    this.writeMeta();
-    this.writeStatus({
-      partnerSeatId: this.partnerSeatId,
-      state: "running",
-    });
-
-    this.child.onData((data) => {
-      process.stdout.write(data);
-      if (this.shouldUseGenericCapture()) {
-        this.genericTracker.append(data);
-      }
-    });
-
-    this.child.onExit(({ exitCode, signal }) => {
-      this.childExit = {
-        exitCode,
-        signal: signal || null,
-      };
+  installStopSignals() {
+    const requestStop = () => {
       this.stopped = true;
-    });
+    };
+
+    process.on("SIGTERM", requestStop);
+    process.on("SIGHUP", requestStop);
+  }
+
+  trackInput(text) {
+    for (const char of String(text || "")) {
+      if (char === CTRL_C) {
+        this.pendingInput = "";
+        this.tracker.noteTurnStart("");
+        continue;
+      }
+
+      if (char === "\r" || char === "\n") {
+        const submitted = sanitizeRelayText(this.pendingInput, 12000);
+        this.pendingInput = "";
+        this.tracker.noteTurnStart(submitted);
+        continue;
+      }
+
+      this.pendingInput += char;
+      if (this.pendingInput.length > 4000) {
+        this.pendingInput = this.pendingInput.slice(-4000);
+      }
+    }
   }
 
   partnerIsLive() {
-    const partnerStatus = readJson(this.partnerPaths.statusPath, null);
-    return Boolean(partnerStatus?.pid && isPidAlive(partnerStatus.pid));
-  }
-
-  maybeMarkLinked() {
-    if (this.linked || !this.partnerIsLive()) {
-      return;
-    }
-
-    this.linked = true;
-    this.log(`${BRAND} seat ${this.seatId} linked with seat ${this.partnerSeatId} in session ${this.sessionName}.`);
-  }
-
-  shouldUseGenericCapture() {
-    return !this.agentType;
+    const partner = readJson(this.partnerPaths.statusPath, null);
+    return Boolean(partner?.pid && isPidAlive(partner.pid));
   }
 
   pullPartnerEvents() {
@@ -401,23 +335,12 @@ class SeatProcess {
 
     const entries = parseAnswerEntries(text);
     for (const entry of entries) {
-      if (!this.child) {
-        continue;
-      }
-      if (Number.isFinite(this.maxRelays) && this.relayCount >= this.maxRelays) {
-        this.log(`${BRAND} seat ${this.seatId} hit the relay cap (${this.maxRelays}).`);
-        continue;
-      }
-
       const payload = sanitizeRelayText(entry.text);
-      if (!payload) {
+      if (!payload || !this.child) {
         continue;
       }
 
-      if (this.shouldUseGenericCapture()) {
-        this.genericTracker.noteTurnStart(payload);
-      }
-
+      this.tracker.noteTurnStart(payload);
       this.child.write(payload.replace(/\n/g, "\r"));
       this.child.write("\r");
       this.relayCount += 1;
@@ -425,125 +348,40 @@ class SeatProcess {
     }
   }
 
-  resolveStructuredLog() {
-    if (!this.agentType || this.sessionState.file) {
-      return;
-    }
-
-    const sessionFile = resolveSessionFile(this.agentType, this.cwd, this.processStartedAtMs, {
-      snapshotEnv: this.agentType === "codex"
-        ? {
-          MUUUUSE_CHILD_TOKEN: this.childToken,
-          MUUUUSE_SEAT: String(this.seatId),
-          MUUUUSE_SESSION: this.sessionName,
-        }
-        : null,
-    });
-    if (!sessionFile) {
-      return;
-    }
-
-    this.sessionState.file = sessionFile;
-    if (this.agentType === "gemini") {
-      const baseline = readGeminiAnswers(sessionFile, null);
-      this.sessionState.lastMessageId = baseline.lastMessageId;
-      this.sessionState.offset = baseline.fileSize;
-    } else {
-      this.sessionState.offset = getFileSize(sessionFile);
-    }
-  }
-
-  collectStructuredAnswers() {
-    this.resolveStructuredLog();
-    if (!this.sessionState.file || !this.agentType) {
-      return;
-    }
-
-    const answers = [];
-    if (this.agentType === "codex") {
-      const result = readCodexAnswers(this.sessionState.file, this.sessionState.offset);
-      this.sessionState.offset = result.nextOffset;
-      answers.push(...result.answers);
-    } else if (this.agentType === "claude") {
-      const result = readClaudeAnswers(this.sessionState.file, this.sessionState.offset);
-      this.sessionState.offset = result.nextOffset;
-      answers.push(...result.answers);
-    } else if (this.agentType === "gemini") {
-      const result = readGeminiAnswers(this.sessionState.file, this.sessionState.lastMessageId);
-      this.sessionState.lastMessageId = result.lastMessageId;
-      this.sessionState.offset = result.fileSize;
-      answers.push(...result.answers);
-    }
-
-    for (const answer of answers) {
-      this.emitAnswer({
-        createdAt: answer.timestamp,
-        id: answer.id,
-        origin: this.agentType,
-        text: answer.text,
-      });
-    }
-  }
-
-  collectGenericAnswers() {
-    if (!this.shouldUseGenericCapture()) {
-      return;
-    }
-
-    const text = this.genericTracker.consumeReady();
-    if (!text) {
-      return;
-    }
-
-    this.emitAnswer({
-      createdAt: new Date().toISOString(),
-      id: createId(12),
-      origin: "generic",
-      text,
-    });
-  }
-
-  emitAnswer(entry) {
-    const text = sanitizeRelayText(entry.text);
-    if (!text) {
+  emitAnswer(text) {
+    const payload = sanitizeRelayText(text);
+    if (!payload) {
       return;
     }
 
     appendJsonl(this.paths.eventsPath, {
-      id: entry.id || createId(12),
+      id: createId(12),
       type: "answer",
       seatId: this.seatId,
-      origin: entry.origin || "unknown",
-      text,
-      createdAt: entry.createdAt || new Date().toISOString(),
+      text: payload,
+      createdAt: new Date().toISOString(),
     });
 
-    this.log(`[${this.seatId}] ${previewText(text)}`);
+    this.log(`[${this.seatId}] ${previewText(payload)}`);
   }
 
   async tick() {
-    this.maybeMarkLinked();
     this.pullPartnerEvents();
-    this.collectStructuredAnswers();
-    this.collectGenericAnswers();
-
     this.writeStatus({
-      partnerSeatId: this.partnerSeatId,
       partnerLive: this.partnerIsLive(),
       state: this.childExit ? "exited" : "running",
-      structuredLog: this.sessionState.file,
     });
   }
 
   async run() {
-    this.installSignalHandlers();
-    this.launchChild();
+    this.installStopSignals();
+    this.launchShell();
     this.installStdinProxy();
     this.installResizeHandler();
 
-    this.log(`${BRAND} seat ${this.seatId} started in session ${this.sessionName}.`);
-    this.log(`Command: ${formatCommand(this.commandTokens)}`);
-    this.log(`Stop everything from another terminal with: muuuuse stop`);
+    this.log(`${BRAND} seat ${this.seatId} armed for ${this.sessionName}.`);
+    this.log("Use this shell normally. When a program rings the terminal bell, the final block relays to the partner seat.");
+    this.log("Run `muuuuse stop` from any other shell to stop the loop.");
 
     try {
       while (!this.stopped) {
@@ -569,169 +407,92 @@ class SeatProcess {
 
     stopTrackedSeat({
       childPid: this.childPid,
-      childPgid: this.childPgid,
-      wrapperPid: null,
+      wrapperPid: process.pid,
     });
 
     this.writeMeta({
       childPid: this.childPid,
-      childPgid: this.childPgid,
       exitedAt: new Date().toISOString(),
     });
     this.writeStatus({
       childPid: this.childPid,
-      childPgid: this.childPgid,
-      exitCode: this.childExit?.exitCode ?? null,
       exitedAt: new Date().toISOString(),
-      partnerSeatId: this.partnerSeatId,
       state: "exited",
     });
   }
 }
 
-function uniquePids(pids) {
-  return [...new Set(pids.filter((pid) => Number.isInteger(pid) && pid > 0))];
+function previewText(text, maxLength = 88) {
+  const compact = sanitizeRelayText(text).replace(/\s+/g, " ");
+  if (compact.length <= maxLength) {
+    return compact;
+  }
+  return `${compact.slice(0, maxLength - 3)}...`;
 }
 
 function signalPid(pid, signal) {
   if (!Number.isInteger(pid) || pid <= 0 || !isPidAlive(pid)) {
     return false;
   }
-
   try {
     process.kill(pid, signal);
     return true;
-  } catch (error) {
+  } catch {
     return false;
   }
 }
 
-function signalProcessGroup(pgid, signal) {
-  if (!Number.isInteger(pgid) || pgid <= 0) {
-    return false;
-  }
-
-  try {
-    process.kill(-pgid, signal);
-    return true;
-  } catch (error) {
-    return false;
-  }
-}
-
-function stopTrackedSeat({ wrapperPid = null, childPid = null, childPgid = null }) {
-  const descendantPids = uniquePids([
-    ...getDescendantPids(wrapperPid),
-    ...getDescendantPids(childPid),
-  ]);
-
-  const allPids = uniquePids([
-    wrapperPid,
-    childPid,
-    ...descendantPids,
-  ]);
-
-  const wrapperStopped = signalPid(wrapperPid, "SIGTERM");
+function stopTrackedSeat({ wrapperPid = null, childPid = null }) {
   const childStopped = signalPid(childPid, "SIGTERM");
-  let groupStopped = signalProcessGroup(childPgid, "SIGTERM");
-
-  for (const pid of descendantPids) {
-    signalPid(pid, "SIGTERM");
-  }
-
-  const survivors = allPids.filter((pid) => isPidAlive(pid));
-  if (survivors.length > 0) {
-    groupStopped = signalProcessGroup(childPgid, "SIGKILL") || groupStopped;
-    for (const pid of survivors) {
-      signalPid(pid, "SIGKILL");
-    }
-  }
-
-  return {
-    childForced: survivors.some((pid) => pid === childPid),
-    childPid,
-    childStopped: childStopped || groupStopped,
-    descendantPids,
-    wrapperForced: survivors.some((pid) => pid === wrapperPid),
-    wrapperPid,
-    wrapperStopped,
-  };
+  const wrapperStopped = wrapperPid === process.pid ? false : signalPid(wrapperPid, "SIGTERM");
+  return { childStopped, wrapperStopped };
 }
 
 function stopSession(sessionName) {
-  const results = [];
-
-  for (const seatId of [1, 2]) {
-    const paths = getSeatPaths(sessionName, seatId);
-    const status = readJson(paths.statusPath, null);
-    const meta = readJson(paths.metaPath, null);
-    const wrapperPid = status?.pid || meta?.pid || null;
-    const childPid = status?.childPid || meta?.childPid || null;
-    const childPgid = status?.childPgid || meta?.childPgid || null;
-
-    results.push({
-      seatId,
-      ...stopTrackedSeat({
-        wrapperPid,
-        childPid,
-        childPgid,
-      }),
-    });
-  }
-
-  return {
-    sessionName,
-    seats: results,
-  };
-}
-
-function listSessionNames() {
-  const sessionsRoot = path.join(getStateRoot(), "sessions");
-  try {
-    return fs.readdirSync(sessionsRoot, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => entry.name)
-      .sort();
-  } catch (error) {
-    return [];
-  }
-}
-
-async function stopSessions(sessionName = null) {
-  const sessionNames = sessionName ? [sessionName] : listSessionNames();
-  const sessionResults = sessionNames.map((name) => stopSession(name));
-
-  return {
-    sessionName,
-    sessions: sessionResults,
-  };
-}
-
-function readSessionStatus(sessionName) {
-  return {
-    sessionName,
-    seats: [1, 2].map((seatId) => {
+  const seats = [1, 2]
+    .map((seatId) => {
       const paths = getSeatPaths(sessionName, seatId);
       const status = readJson(paths.statusPath, null);
+      const wrapperPid = status?.pid || null;
+      const childPid = status?.childPid || null;
+      const wrapperLive = isPidAlive(wrapperPid);
+      const childLive = isPidAlive(childPid);
+
+      if (!wrapperLive && !childLive) {
+        return null;
+      }
+
+      const result = stopTrackedSeat({ wrapperPid, childPid });
+      writeJson(paths.statusPath, {
+        ...(status || {}),
+        state: "stopping",
+        updatedAt: new Date().toISOString(),
+      });
+
       return {
         seatId,
-        status,
+        wrapperStopped: result.wrapperStopped,
+        childStopped: result.childStopped,
       };
-    }),
-  };
+    })
+    .filter(Boolean);
+
+  if (seats.length === 0) {
+    return null;
+  }
+
+  return { sessionName, seats };
 }
 
-function readAllSessionStatuses() {
-  return listSessionNames().map((sessionName) => readSessionStatus(sessionName));
+function stopAllSessions() {
+  const sessions = listSessionNames()
+    .map((sessionName) => stopSession(sessionName))
+    .filter(Boolean);
+  return { sessions };
 }
 
 module.exports = {
-  SeatProcess,
-  formatCommand,
-  readAllSessionStatuses,
-  readSessionStatus,
-  resolveProgramTokens,
+  ArmedSeat,
   resolveSessionName,
-  stopSession,
-  stopSessions,
+  stopAllSessions,
 };

@@ -1,7 +1,7 @@
 {
   "name": "muuuuse",
-  "version": "1.3.2",
-  "description": "🔌Muuuuse wraps two local programs and bounces final blocks between them from the terminal you launched.",
+  "version": "1.4.0",
+  "description": "🔌Muuuuse arms two raw terminals and bounces BEL-marked final output between them.",
   "type": "commonjs",
   "bin": {
     "muuuuse": "bin/muuse.js"
@@ -34,7 +34,6 @@
     "relay",
     "local",
     "automation",
-    "script",
     "codex",
     "claude",
     "gemini"

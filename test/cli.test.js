@@ -1,365 +1,218 @@
 #!/usr/bin/env node
 
 const assert = require("node:assert/strict");
-const { execFileSync, spawn } = require("node:child_process");
+const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const pty = require("node-pty");
 
-const {
-  chooseCandidate,
-  detectAgent,
-  parseClaudeFinalLine,
-  parseCodexFinalLine,
-  readGeminiAnswers,
-} = require("../src/agents");
-const { resolveProgramTokens } = require("../src/runtime");
+const binPath = path.join(__dirname, "..", "bin", "muuse.js");
+const fixturePath = path.join(__dirname, "fixtures", "bell-agent.js");
 
 async function main() {
-  testCodexParsing();
-  testClaudeParsing();
-  testGeminiParsing();
-  testAgentDetection();
-  testCandidateSelectionAvoidsAmbiguousFallback();
-  testPresetExpansion();
-  await testSeatStopsWhenInputCloses();
-  await testStopKillsChildDescendants();
-  await testWrappedSeatRelay();
+  await testUsage();
+  await testRejectsExtraArgs();
+  await testStopWhenNothingIsArmed();
+  await testRepeatedBounceStopRestart();
   process.stdout.write("muuuuse tests passed\n");
 }
 
-function testCodexParsing() {
-  const parsed = parseCodexFinalLine(JSON.stringify({
-    type: "response_item",
-    timestamp: "2026-03-09T12:00:00.000Z",
-    payload: {
-      id: "codex-turn-1",
-      type: "message",
-      role: "assistant",
-      content: [
-        { type: "output_text", text: "First final answer." },
-        { type: "output_text", text: "Second line." },
-      ],
-    },
-  }));
-
-  assert.deepEqual(parsed, {
-    id: "codex-turn-1",
-    text: "First final answer.\nSecond line.",
-    timestamp: "2026-03-09T12:00:00.000Z",
-  });
-}
-
-function testClaudeParsing() {
-  const parsed = parseClaudeFinalLine(JSON.stringify({
-    type: "assistant",
-    uuid: "claude-turn-1",
-    timestamp: "2026-03-09T12:00:00.000Z",
-    message: {
-      role: "assistant",
-      stop_reason: "end_turn",
-      content: [
-        { type: "thinking", thinking: "skip me" },
-        { type: "text", text: "Claude final answer." },
-      ],
-    },
-  }));
-
-  assert.deepEqual(parsed, {
-    id: "claude-turn-1",
-    text: "Claude final answer.",
-    timestamp: "2026-03-09T12:00:00.000Z",
-  });
-}
-
-function testGeminiParsing() {
-  const tempFile = path.join(os.tmpdir(), `muuuuse-gemini-${Date.now()}.json`);
-  fs.writeFileSync(tempFile, JSON.stringify({
-    lastUpdated: "2026-03-09T12:03:00.000Z",
-    messages: [
-      {
-        id: "gm-1",
-        type: "gemini",
-        content: "tool chatter",
-        toolCalls: [{ id: "call-1" }],
-      },
-      {
-        id: "gm-2",
-        type: "gemini",
-        content: "Final Gemini answer.",
-        toolCalls: [],
-        timestamp: "2026-03-09T12:02:00.000Z",
-      },
-    ],
-  }));
-
-  const parsed = readGeminiAnswers(tempFile, null);
-  fs.rmSync(tempFile, { force: true });
-
-  assert.equal(parsed.answers.length, 1);
-  assert.equal(parsed.answers[0].id, "gm-2");
-  assert.equal(parsed.answers[0].text, "Final Gemini answer.");
-}
-
-function testAgentDetection() {
-  const detected = detectAgent([
-    { pid: 11, elapsedSeconds: 9, args: "python helper.py" },
-    { pid: 22, elapsedSeconds: 5, args: "codex -m gpt-5.4" },
-  ]);
-
-  assert.equal(detected.type, "codex");
-  assert.equal(detected.pid, 22);
-}
-
-function testCandidateSelectionAvoidsAmbiguousFallback() {
-  const candidates = [
-    {
-      path: "/tmp/a.jsonl",
-      cwd: "/root/project",
-      startedAtMs: Date.parse("2026-03-12T01:00:00.000Z"),
-      mtimeMs: 10,
-    },
-    {
-      path: "/tmp/b.jsonl",
-      cwd: "/root/project",
-      startedAtMs: Date.parse("2026-03-12T01:00:02.000Z"),
-      mtimeMs: 20,
-    },
-  ];
-
-  const selected = chooseCandidate(candidates, "/root/project", Date.parse("2026-03-12T01:00:01.000Z"));
-  assert.equal(selected, null);
-}
-
-function testPresetExpansion() {
-  const expanded = resolveProgramTokens(["codex"], true);
-  assert.equal(expanded[0], "codex");
-  assert.ok(expanded.includes("--dangerously-bypass-approvals-and-sandbox"));
-}
-
-async function testWrappedSeatRelay() {
-  const root = path.resolve(__dirname, "..");
-  const cliPath = path.join(root, "bin", "muuse.js");
-  const mockProgramPath = path.join(root, "test", "fixtures", "mock-program.js");
-  const sessionName = `muuuuse-test-${Date.now()}`;
-
-  const seatOne = spawn(process.execPath, [
-    cliPath,
-    "1",
-    "--session",
-    sessionName,
-    process.execPath,
-    mockProgramPath,
-    "seat-one",
-    "1",
-  ], {
-    cwd: root,
-    stdio: ["pipe", "pipe", "pipe"],
+async function testUsage() {
+  const output = execFileSync(process.execPath, [binPath], {
+    encoding: "utf8",
+    env: process.env,
   });
 
-  const seatTwo = spawn(process.execPath, [
-    cliPath,
-    "2",
-    "--session",
-    sessionName,
-    process.execPath,
-    mockProgramPath,
-    "seat-two",
-    "1",
-  ], {
-    cwd: root,
-    stdio: ["pipe", "pipe", "pipe"],
+  assert.match(output, /muuuuse 1/);
+  assert.match(output, /muuuuse 2/);
+  assert.match(output, /muuuuse stop/);
+}
+
+async function testRejectsExtraArgs() {
+  assert.throws(() => {
+    execFileSync(process.execPath, [binPath, "1", "codex"], {
+      encoding: "utf8",
+      stdio: "pipe",
+      env: process.env,
+    });
+  }, /no longer takes a program/i);
+}
+
+async function testStopWhenNothingIsArmed() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-empty-home-"));
+  const output = execFileSync(process.execPath, [binPath, "stop"], {
+    encoding: "utf8",
+    env: buildEnv(home),
   });
+
+  assert.match(output, /no armed seats found/i);
+}
+
+async function testRepeatedBounceStopRestart() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-cwd-"));
+
+  for (let cycle = 1; cycle <= 3; cycle += 1) {
+    await runBounceCycle({ cycle, cwd, home });
+  }
+
+  const output = execFileSync(process.execPath, [binPath, "stop"], {
+    encoding: "utf8",
+    cwd,
+    env: buildEnv(home),
+  });
+  assert.match(output, /no armed seats found/i);
+}
+
+async function runBounceCycle({ cycle, cwd, home }) {
+  const seat1 = spawnSeat(1, { cwd, home });
+  const seat2 = spawnSeat(2, { cwd, home });
 
   try {
-    await waitForStream(seatOne.stderr, /seat 1 started/i, 10000);
-    await waitForStream(seatTwo.stderr, /seat 2 started/i, 10000);
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
 
-    seatOne.stdin.write("kickoff\n");
+    seat1.write(`node ${fixturePath} codex\r`);
+    seat2.write(`node ${fixturePath} gemini\r`);
 
-    await waitForStream(seatOne.stdout, /seat-one: kickoff/i, 10000);
-    await waitForStream(seatTwo.stdout, /seat-two: seat-one: kickoff/i, 10000);
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
 
-    const statusOutput = execFileSync(process.execPath, [
-      cliPath,
-      "status",
-      "--session",
-      sessionName,
-    ], {
-      cwd: root,
+    seat1.write(`ignite cycle ${cycle}\r`);
+
+    await seat1.waitFor(/codex turn 1:/);
+    await seat2.waitFor(/gemini turn 1:/);
+    await seat1.waitFor(/codex turn 2:/);
+    await seat2.waitFor(/gemini turn 2:/);
+    await seat1.waitFor(/codex turn 3:/);
+
+    const stopOutput = execFileSync(process.execPath, [binPath, "stop"], {
       encoding: "utf8",
-    });
-
-    assert.match(statusOutput, /seat 1: running/i);
-    assert.match(statusOutput, /seat 2: running/i);
-
-    const stopOutput = execFileSync(process.execPath, [
-      cliPath,
-      "stop",
-      "--session",
-      sessionName,
-    ], {
-      cwd: root,
-      encoding: "utf8",
+      cwd,
+      env: buildEnv(home),
     });
 
     assert.match(stopOutput, /stop requested/i);
-    await Promise.all([
-      waitForExit(seatOne, 10000),
-      waitForExit(seatTwo, 10000),
-    ]);
+    await seat1.waitForExit();
+    await seat2.waitForExit();
   } finally {
-    safeKill(seatOne);
-    safeKill(seatTwo);
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
   }
 }
 
-async function testSeatStopsWhenInputCloses() {
-  const root = path.resolve(__dirname, "..");
-  const cliPath = path.join(root, "bin", "muuse.js");
-  const mockProgramPath = path.join(root, "test", "fixtures", "mock-program.js");
-  const sessionName = `muuuuse-close-${Date.now()}`;
+function buildEnv(home) {
+  return {
+    ...process.env,
+    HOME: home,
+    SHELL: "/bin/sh",
+    PS1: "",
+    PROMPT_COMMAND: "",
+    TERM: "xterm-256color",
+  };
+}
 
-  const seat = spawn(process.execPath, [
-    cliPath,
-    "1",
-    "--session",
-    sessionName,
-    process.execPath,
-    mockProgramPath,
-    "seat-close",
-    "1",
-  ], {
-    cwd: root,
-    stdio: ["pipe", "pipe", "pipe"],
+function spawnSeat(seatId, { cwd, home }) {
+  const term = pty.spawn(process.execPath, [binPath, String(seatId)], {
+    cwd,
+    env: buildEnv(home),
+    cols: 100,
+    rows: 30,
+    name: "xterm-256color",
   });
 
-  try {
-    await waitForStream(seat.stderr, /seat 1 started/i, 10000);
-    seat.stdin.end();
-    const result = await waitForExit(seat, 10000);
-    assert.equal(typeof result.code, "number");
-  } finally {
-    safeKill(seat);
-  }
-}
-
-async function testStopKillsChildDescendants() {
-  const root = path.resolve(__dirname, "..");
-  const cliPath = path.join(root, "bin", "muuse.js");
-  const pidFile = path.join(os.tmpdir(), `muuuuse-descendant-${Date.now()}.pid`);
-  const spawnGrandchildPath = path.join(root, "test", "fixtures", "spawn-grandchild.js");
-  const sessionName = `muuuuse-desc-${Date.now()}`;
-
-  const seat = spawn(process.execPath, [
-    cliPath,
-    "1",
-    "--session",
-    sessionName,
-    process.execPath,
-    spawnGrandchildPath,
-    pidFile,
-  ], {
-    cwd: root,
-    stdio: ["pipe", "pipe", "pipe"],
+  let buffer = "";
+  let disposed = false;
+  let resolveExit;
+  const exitPromise = new Promise((resolve) => {
+    resolveExit = resolve;
   });
 
-  try {
-    await waitForStream(seat.stderr, /seat 1 started/i, 10000);
-    const grandchildPid = await waitForPidFile(pidFile, 10000);
-    assert.equal(isAlive(grandchildPid), true);
+  term.onData((data) => {
+    buffer += data;
+    if (buffer.length > 120000) {
+      buffer = buffer.slice(-120000);
+    }
+  });
 
-    execFileSync(process.execPath, [
-      cliPath,
-      "stop",
-      "--session",
-      sessionName,
-    ], {
-      cwd: root,
-      encoding: "utf8",
-    });
+  term.onExit((event) => {
+    resolveExit(event);
+  });
 
-    await waitForExit(seat, 10000);
-    await waitForCondition(() => !isAlive(grandchildPid), 10000);
-  } finally {
-    safeKill(seat);
-    fs.rmSync(pidFile, { force: true });
-  }
-}
-
-function waitForStream(stream, pattern, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    let collected = "";
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error(`Timed out waiting for ${pattern}\n\n${collected}`));
-    }, timeoutMs);
-
-    const onData = (chunk) => {
-      collected += chunk.toString("utf8");
-      if (pattern.test(collected)) {
-        cleanup();
-        resolve(collected);
+  return {
+    write(text) {
+      term.write(text);
+    },
+    async waitFor(pattern, timeoutMs = 15000) {
+      return waitForBuffer(() => buffer, pattern, timeoutMs, `seat ${seatId}`);
+    },
+    async waitForExit(timeoutMs = 10000) {
+      return waitForPromise(exitPromise, timeoutMs, `seat ${seatId} exit`);
+    },
+    dispose() {
+      if (disposed) {
+        return;
       }
-    };
-
-    const cleanup = () => {
-      clearTimeout(timer);
-      stream.off("data", onData);
-    };
-
-    stream.on("data", onData);
-  });
+      disposed = true;
+      try {
+        term.kill();
+      } catch {
+        // best effort cleanup
+      }
+    },
+  };
 }
 
-function waitForExit(child, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`Timed out waiting for pid ${child.pid} to exit`));
-    }, timeoutMs);
-
-    child.once("exit", (code, signal) => {
-      clearTimeout(timer);
-      resolve({ code, signal });
+async function forceStop(home, cwd) {
+  try {
+    execFileSync(process.execPath, [binPath, "stop"], {
+      encoding: "utf8",
+      cwd,
+      env: buildEnv(home),
+      stdio: "pipe",
     });
-  });
-}
-
-function safeKill(child) {
-  if (!child || child.killed) {
-    return;
-  }
-
-  try {
-    child.kill("SIGTERM");
-  } catch (error) {
-    // Ignore cleanup races.
+  } catch {
+    // best effort cleanup
   }
 }
 
-function isAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return false;
-  }
-}
-
-async function waitForPidFile(filePath, timeoutMs) {
-  await waitForCondition(() => fs.existsSync(filePath), timeoutMs);
-  return Number.parseInt(fs.readFileSync(filePath, "utf8").trim(), 10);
-}
-
-async function waitForCondition(check, timeoutMs) {
+async function waitForBuffer(getBuffer, pattern, timeoutMs, label) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    if (check()) {
-      return;
+    const current = getBuffer();
+    if (matches(current, pattern)) {
+      return current;
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await sleep(50);
   }
-  throw new Error("Timed out waiting for condition");
+
+  throw new Error(`${label} timed out waiting for ${String(pattern)}.\n\n${getBuffer()}`);
+}
+
+async function waitForPromise(promise, timeoutMs, label) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms.`)), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function matches(text, pattern) {
+  if (pattern instanceof RegExp) {
+    return pattern.test(text);
+  }
+  return String(text).includes(String(pattern));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 main().catch((error) => {
