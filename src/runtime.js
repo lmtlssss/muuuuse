@@ -42,7 +42,6 @@ const PENDING_RELAY_CONTEXT_TTL_MS = 2 * 60 * 1000;
 const EMITTED_ANSWER_TTL_MS = 5 * 60 * 1000;
 const MAX_RECENT_INBOUND_RELAYS = 12;
 const MAX_RECENT_EMITTED_ANSWERS = 48;
-const MAX_RELAY_CHAIN_HOP = 1;
 const STOP_FORCE_KILL_MS = 1200;
 const SEAT_JOIN_WAIT_MS = 3000;
 const SEAT_JOIN_POLL_MS = 60;
@@ -932,12 +931,6 @@ class ArmedSeat {
     return Boolean(partner?.pid && isPidAlive(partner.pid));
   }
 
-  getPartnerFlowMode() {
-    const partnerStatus = readJson(this.partnerPaths.statusPath, null);
-    const partnerMeta = readJson(this.partnerPaths.metaPath, null);
-    return normalizeFlowMode(partnerStatus?.flowMode || partnerMeta?.flowMode || "off");
-  }
-
   stopRequested() {
     const request = readJson(this.sessionPaths.stopPath, null);
     if (!request?.requestedAt) {
@@ -1003,7 +996,6 @@ class ArmedSeat {
         deliveredAtMs,
         expiresAtMs: deliveredAtMs + PENDING_RELAY_CONTEXT_TTL_MS,
         hop: Number.isInteger(entry.hop) ? entry.hop : 0,
-        relayUsed: false,
       };
       this.relayCount += 1;
       this.rememberInboundRelay(payload);
@@ -1258,21 +1250,6 @@ class ArmedSeat {
     }
 
     const pendingInboundContext = this.getPendingInboundContext();
-    const partnerFlowMode = this.getPartnerFlowMode();
-    if (
-      this.flowMode !== "on" &&
-      partnerFlowMode !== "on" &&
-      pendingInboundContext &&
-      pendingInboundContext.hop >= MAX_RELAY_CHAIN_HOP
-    ) {
-      this.log(`[${this.seatId}] suppressed relay loop: ${previewText(payload)}`);
-      return;
-    }
-
-    if (pendingInboundContext?.relayUsed) {
-      this.log(`[${this.seatId}] suppressed extra queued relay output: ${previewText(payload)}`);
-      return;
-    }
 
     const entryId = entry.id || createId(12);
     const signedEntry = {
@@ -1293,9 +1270,6 @@ class ArmedSeat {
     );
     appendJsonl(this.paths.eventsPath, signedEntry);
     this.rememberEmittedAnswer(answerKey);
-    if (pendingInboundContext) {
-      pendingInboundContext.relayUsed = true;
-    }
 
     this.log(`[${this.seatId}] ${previewText(payload)}`);
   }
@@ -1413,12 +1387,13 @@ function previewText(text, maxLength = 88) {
 function buildAnswerKey(entry, payload) {
   const origin = String(entry.origin || "unknown").trim() || "unknown";
   const id = typeof entry.id === "string" ? entry.id.trim() : "";
+  const payloadHash = hashText(payload);
   if (id) {
-    return `${origin}:${id}`;
+    return `${origin}:${id}:${payloadHash}`;
   }
 
   const createdAt = typeof entry.createdAt === "string" ? entry.createdAt : "";
-  return `${origin}:${createdAt}:${hashText(payload)}`;
+  return `${origin}:${createdAt}:${payloadHash}`;
 }
 
 function buildSeatReport(sessionName, seatId) {

@@ -53,9 +53,9 @@ async function main() {
   await testForgedPartnerEventsAreIgnored();
   await testDuplicateAnswerIdsAreDeduped();
   await testMirrorRepliesDoNotPingPong();
-  await testAlternatingRepliesStopAfterSingleBounce();
+  await testAlternatingRepliesContinueUntilStopped();
   await testMixedFlowModesAllowContinuedReplies();
-  await testQueuedRepliesAfterInboundStaySuppressed();
+  await testQueuedRepliesAfterInboundAreRelayed();
   await testMultilineRelaySubmitsOnce();
   await testPassiveTerminalReportsDoNotClearRelayContext();
   await testBareEscapeDoesNotClearRelayContext();
@@ -735,7 +735,7 @@ async function testMirrorRepliesDoNotPingPong() {
   }
 }
 
-async function testAlternatingRepliesStopAfterSingleBounce() {
+async function testAlternatingRepliesContinueUntilStopped() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-alternating-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-alternating-cwd-"));
   const seat1 = spawnSeat(1, { cwd, home });
@@ -746,8 +746,8 @@ async function testAlternatingRepliesStopAfterSingleBounce() {
     await seat2.waitFor(/seat 2 armed/i);
     const sessionName = await waitForSessionName(home, cwd);
 
-    seat1.write(`MOCK_REPLY_TEXT=ONE ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
-    seat2.write(`MOCK_REPLY_TEXT=TWO ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+    seat1.write(`MOCK_REPLY_TEXT=ONE MOCK_REPLY_DELAY_MS=120 ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`MOCK_REPLY_TEXT=TWO MOCK_REPLY_DELAY_MS=120 ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-ready/);
@@ -766,8 +766,10 @@ async function testAlternatingRepliesStopAfterSingleBounce() {
     const seat1Events = readAnswerEvents(home, sessionName, 1);
     const seat2Events = readAnswerEvents(home, sessionName, 2);
 
-    assert.deepEqual(seat1Events.map((entry) => entry.text), ["ONE"]);
-    assert.deepEqual(seat2Events.map((entry) => entry.text), ["TWO"]);
+    assert.equal(seat1Events[0].text, "ONE");
+    assert.equal(seat2Events[0].text, "TWO");
+    assert(seat1Events.length >= 2);
+    assert(seat2Events.length >= 2);
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();
@@ -819,7 +821,7 @@ async function testMixedFlowModesAllowContinuedReplies() {
   }
 }
 
-async function testQueuedRepliesAfterInboundStaySuppressed() {
+async function testQueuedRepliesAfterInboundAreRelayed() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-queued-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-queued-cwd-"));
   const seat1 = spawnSeat(1, { cwd, home });
@@ -830,8 +832,8 @@ async function testQueuedRepliesAfterInboundStaySuppressed() {
     await seat2.waitFor(/seat 2 armed/i);
     const sessionName = await waitForSessionName(home, cwd);
 
-    seat1.write(`MOCK_REPLY_TEXT=ONE ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
-    seat2.write(`MOCK_REPLY_SEQUENCE=TWO\\|EXTRA ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+    seat1.write(`MOCK_REPLY_TEXT=ONE MOCK_REPLY_DELAY_MS=400 ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`MOCK_REPLY_SEQUENCE='TWO|EXTRA' MOCK_REPLY_DELAY_MS=80 ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-ready/);
@@ -849,8 +851,10 @@ async function testQueuedRepliesAfterInboundStaySuppressed() {
     const seat1Events = readAnswerEvents(home, sessionName, 1);
     const seat2Events = readAnswerEvents(home, sessionName, 2);
 
-    assert.deepEqual(seat1Events.map((entry) => entry.text), ["ONE"]);
-    assert.deepEqual(seat2Events.map((entry) => entry.text), ["TWO"]);
+    assert.equal(seat1Events[0].text, "ONE");
+    assert.deepEqual(seat2Events.slice(0, 2).map((entry) => entry.text), ["TWO", "EXTRA"]);
+    assert.equal(seat2Events[0].hop, 1);
+    assert.equal(seat2Events[1].hop, 1);
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();
@@ -888,8 +892,10 @@ async function testMultilineRelaySubmitsOnce() {
     const seat1Events = readAnswerEvents(home, sessionName, 1);
     const seat2Events = readAnswerEvents(home, sessionName, 2);
 
-    assert.deepEqual(seat1Events.map((entry) => entry.text), ["ALPHA\nBETA"]);
-    assert.deepEqual(seat2Events.map((entry) => entry.text), ["ALPHA BETA"]);
+    assert.equal(seat1Events[0].text, "ALPHA\nBETA");
+    assert.equal(seat2Events[0].text, "ALPHA BETA");
+    assert.equal(seat1Events.some((entry) => entry.text === "ALPHA" || entry.text === "BETA"), false);
+    assert.equal(seat2Events.some((entry) => entry.text === "ALPHA" || entry.text === "BETA"), false);
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();
