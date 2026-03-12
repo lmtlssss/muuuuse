@@ -15,12 +15,12 @@ The main flow is:
 ```bash
 muuuuse 1 <program...>
 muuuuse 2 <program...>
-muuuuse 3 stop
+muuuuse stop
 ```
 
 Seat `1` and seat `2` each launch and own a real local program under a PTY wrapper. Once both seats are alive in the same lane, they automatically bounce final blocks between each other by typing the partner answer plus `Enter` into the wrapped program.
 
-`muuuuse 3 stop` is the cleanup command for that lane.
+`muuuuse stop` is the real cleanup command. With no flags it force-stops every tracked lane. Use `--session <name>` if you only want one explicit lane.
 
 ## Install
 
@@ -45,7 +45,7 @@ muuuuse 2 gemini
 Terminal 3:
 
 ```bash
-muuuuse 3 stop
+muuuuse stop
 ```
 
 Known presets expand to recommended flags automatically:
@@ -80,13 +80,13 @@ If you want an explicit lane name, use:
 ```bash
 muuuuse 1 --session demo codex
 muuuuse 2 --session demo gemini
-muuuuse 3 --session demo stop
+muuuuse stop --session demo
 ```
 
 You can also inspect the lane:
 
 ```bash
-muuuuse 3 status
+muuuuse status
 ```
 
 ## Doctor

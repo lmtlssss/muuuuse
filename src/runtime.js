@@ -20,6 +20,7 @@ const {
   getDefaultSessionName,
   getFileSize,
   getSeatPaths,
+  getStateRoot,
   hashText,
   isPidAlive,
   readAppendedText,
@@ -265,6 +266,7 @@ class SeatProcess {
       this.stopped = true;
     };
     process.once("SIGINT", stop);
+    process.once("SIGHUP", stop);
     process.once("SIGTERM", stop);
   }
 
@@ -280,15 +282,22 @@ class SeatProcess {
         this.genericTracker.noteTurnStart("");
       }
     };
+    const handleEnd = () => {
+      this.stopped = true;
+    };
 
     if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
       process.stdin.setRawMode(true);
     }
     process.stdin.resume();
     process.stdin.on("data", handleData);
+    process.stdin.on("close", handleEnd);
+    process.stdin.on("end", handleEnd);
 
     this.stdinCleanup = () => {
       process.stdin.off("data", handleData);
+      process.stdin.off("close", handleEnd);
+      process.stdin.off("end", handleEnd);
       if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
         process.stdin.setRawMode(false);
       }
@@ -528,7 +537,7 @@ class SeatProcess {
 
     this.log(`${BRAND} seat ${this.seatId} started in session ${this.sessionName}.`);
     this.log(`Command: ${formatCommand(this.commandTokens)}`);
-    this.log(`Stop both seats from another terminal with: muuuuse 3 stop`);
+    this.log(`Stop everything from another terminal with: muuuuse stop`);
 
     try {
       while (!this.stopped) {
@@ -620,6 +629,56 @@ function stopSession(sessionName) {
   };
 }
 
+function listSessionNames() {
+  const sessionsRoot = path.join(getStateRoot(), "sessions");
+  try {
+    return fs.readdirSync(sessionsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch (error) {
+    return [];
+  }
+}
+
+async function stopSessions(sessionName = null) {
+  const sessionNames = sessionName ? [sessionName] : listSessionNames();
+  const sessionResults = sessionNames.map((name) => stopSession(name));
+
+  await sleep(200);
+
+  for (const sessionResult of sessionResults) {
+    for (const seat of sessionResult.seats) {
+      if (seat.wrapperPid && isPidAlive(seat.wrapperPid)) {
+        try {
+          process.kill(seat.wrapperPid, "SIGKILL");
+          seat.wrapperForced = true;
+        } catch (error) {
+          seat.wrapperForced = false;
+        }
+      } else {
+        seat.wrapperForced = false;
+      }
+
+      if (seat.childPid && isPidAlive(seat.childPid)) {
+        try {
+          process.kill(seat.childPid, "SIGKILL");
+          seat.childForced = true;
+        } catch (error) {
+          seat.childForced = false;
+        }
+      } else {
+        seat.childForced = false;
+      }
+    }
+  }
+
+  return {
+    sessionName,
+    sessions: sessionResults,
+  };
+}
+
 function readSessionStatus(sessionName) {
   return {
     sessionName,
@@ -634,11 +693,17 @@ function readSessionStatus(sessionName) {
   };
 }
 
+function readAllSessionStatuses() {
+  return listSessionNames().map((sessionName) => readSessionStatus(sessionName));
+}
+
 module.exports = {
   SeatProcess,
   formatCommand,
+  readAllSessionStatuses,
   readSessionStatus,
   resolveProgramTokens,
   resolveSessionName,
   stopSession,
+  stopSessions,
 };

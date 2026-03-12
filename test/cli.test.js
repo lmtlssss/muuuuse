@@ -22,6 +22,7 @@ async function main() {
   testAgentDetection();
   testCandidateSelectionAvoidsAmbiguousFallback();
   testPresetExpansion();
+  await testSeatStopsWhenInputCloses();
   await testWrappedSeatRelay();
   process.stdout.write("muuuuse tests passed\n");
 }
@@ -180,10 +181,9 @@ async function testWrappedSeatRelay() {
 
     const statusOutput = execFileSync(process.execPath, [
       cliPath,
-      "3",
+      "status",
       "--session",
       sessionName,
-      "status",
     ], {
       cwd: root,
       encoding: "utf8",
@@ -194,10 +194,9 @@ async function testWrappedSeatRelay() {
 
     const stopOutput = execFileSync(process.execPath, [
       cliPath,
-      "3",
+      "stop",
       "--session",
       sessionName,
-      "stop",
     ], {
       cwd: root,
       encoding: "utf8",
@@ -211,6 +210,36 @@ async function testWrappedSeatRelay() {
   } finally {
     safeKill(seatOne);
     safeKill(seatTwo);
+  }
+}
+
+async function testSeatStopsWhenInputCloses() {
+  const root = path.resolve(__dirname, "..");
+  const cliPath = path.join(root, "bin", "muuse.js");
+  const mockProgramPath = path.join(root, "test", "fixtures", "mock-program.js");
+  const sessionName = `muuuuse-close-${Date.now()}`;
+
+  const seat = spawn(process.execPath, [
+    cliPath,
+    "1",
+    "--session",
+    sessionName,
+    process.execPath,
+    mockProgramPath,
+    "seat-close",
+    "1",
+  ], {
+    cwd: root,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  try {
+    await waitForStream(seat.stderr, /seat 1 started/i, 10000);
+    seat.stdin.end();
+    const result = await waitForExit(seat, 10000);
+    assert.equal(typeof result.code, "number");
+  } finally {
+    safeKill(seat);
   }
 }
 
