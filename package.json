@@ -1,7 +1,7 @@
 {
   "name": "muuuuse",
-  "version": "0.2.0",
-  "description": "🔌Muuuuse links two local tmux terminals through a third control seat so Codex, Claude, Gemini, or scripts can bounce final answers forever.",
+  "version": "0.3.0",
+  "description": "🔌Muuuuse wraps two local programs and bounces final blocks between them from the terminal you launched.",
   "type": "commonjs",
   "bin": {
     "muuuuse": "bin/muuse.js"
@@ -30,9 +30,11 @@
   "keywords": [
     "terminal",
     "ai",
-    "tmux",
+    "pty",
     "relay",
     "local",
+    "automation",
+    "script",
     "codex",
     "claude",
     "gemini"
@@ -41,5 +43,8 @@
     "test": "node test/cli.test.js",
     "pack:local": "npm pack",
     "prepublishOnly": "npm test"
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0"
   }
 }

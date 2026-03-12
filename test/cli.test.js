@@ -1,22 +1,26 @@
 #!/usr/bin/env node
 
 const assert = require("node:assert/strict");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { detectAgent, parseClaudeFinalLine, parseCodexFinalLine, readGeminiAnswers } = require("../src/agents");
-const { PRESETS, extractCodexPaneAnswer } = require("../src/runtime");
+const {
+  detectAgent,
+  parseClaudeFinalLine,
+  parseCodexFinalLine,
+  readGeminiAnswers,
+} = require("../src/agents");
+const { resolveProgramTokens } = require("../src/runtime");
 
 async function main() {
   testCodexParsing();
   testClaudeParsing();
   testGeminiParsing();
   testAgentDetection();
-  testCodexPaneFallback();
-  testPresetCommands();
-  await testThreeSeatScriptLoop();
+  testPresetExpansion();
+  await testWrappedSeatRelay();
   process.stdout.write("muuuuse tests passed\n");
 }
 
@@ -103,111 +107,139 @@ function testAgentDetection() {
   assert.equal(detected.pid, 22);
 }
 
-function testCodexPaneFallback() {
-  const parsed = extractCodexPaneAnswer([
-    "╭───────────────────────────────────────────────╮",
-    "│ >_ OpenAI Codex (v0.112.0)                    │",
-    "",
-    "› Reply with exactly ALPHA and nothing else.",
-    "",
-    "",
-    "• ALPHA",
-    "",
-    "",
-    "› Summarize recent commits",
-    "",
-    "  gpt-5.4 low · 100% left · ~/_ops-bank/npm-reservations/muuuuse",
-  ].join("\n"));
-
-  assert.equal(parsed, "ALPHA");
+function testPresetExpansion() {
+  const expanded = resolveProgramTokens(["codex"], true);
+  assert.equal(expanded[0], "codex");
+  assert.ok(expanded.includes("--dangerously-bypass-approvals-and-sandbox"));
 }
 
-function testPresetCommands() {
-  assert.ok(PRESETS.codex.command.includes("--dangerously-bypass-approvals-and-sandbox"));
-  assert.ok(PRESETS.codex.command.includes("gpt-5.4"));
-  assert.ok(PRESETS.claude.command.includes("--dangerously-skip-permissions"));
-  assert.ok(PRESETS.gemini.command.includes("--approval-mode"));
-}
-
-async function testThreeSeatScriptLoop() {
+async function testWrappedSeatRelay() {
   const root = path.resolve(__dirname, "..");
   const cliPath = path.join(root, "bin", "muuse.js");
+  const mockProgramPath = path.join(root, "test", "fixtures", "mock-program.js");
   const sessionName = `muuuuse-test-${Date.now()}`;
 
+  const seatOne = spawn(process.execPath, [
+    cliPath,
+    "1",
+    "--session",
+    sessionName,
+    process.execPath,
+    mockProgramPath,
+    "seat-one",
+    "1",
+  ], {
+    cwd: root,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  const seatTwo = spawn(process.execPath, [
+    cliPath,
+    "2",
+    "--session",
+    sessionName,
+    process.execPath,
+    mockProgramPath,
+    "seat-two",
+    "1",
+  ], {
+    cwd: root,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
   try {
-    runTmux(["new-session", "-d", "-s", sessionName, "-c", root, "bash"]);
-    runTmux(["new-window", "-t", sessionName, "-c", root, "bash"]);
-    runTmux(["new-window", "-t", sessionName, "-c", root, "bash"]);
+    await waitForStream(seatOne.stderr, /seat 1 started/i, 10000);
+    await waitForStream(seatTwo.stderr, /seat 2 started/i, 10000);
 
-    await warmWindow(sessionName, 0, root);
-    await warmWindow(sessionName, 1, root);
-    await warmWindow(sessionName, 2, root);
+    seatOne.stdin.write("kickoff\n");
 
-    sendLine(sessionName, 0, `node ${shellQuote(cliPath)} 1`);
-    sendLine(sessionName, 1, `node ${shellQuote(cliPath)} 2`);
-    await waitForPaneText(sessionName, 0, /armed seat 1/i, 15000);
-    await waitForPaneText(sessionName, 1, /armed seat 2/i, 15000);
+    await waitForStream(seatOne.stdout, /seat-one: kickoff/i, 10000);
+    await waitForStream(seatTwo.stdout, /seat-two: seat-one: kickoff/i, 10000);
 
-    sendLine(sessionName, 0, `node ${shellQuote(cliPath)} script 1 --step seat-one`);
-    sendLine(sessionName, 1, `node ${shellQuote(cliPath)} script 1 --step seat-two`);
-    await waitForPaneText(sessionName, 0, /script mode/i, 15000);
-    await waitForPaneText(sessionName, 1, /script mode/i, 15000);
+    const statusOutput = execFileSync(process.execPath, [
+      cliPath,
+      "3",
+      "--session",
+      sessionName,
+      "status",
+    ], {
+      cwd: root,
+      encoding: "utf8",
+    });
 
-    sendLine(sessionName, 2, `node ${shellQuote(cliPath)} 3 --max-relays 4 kickoff`);
-    await waitForPaneText(sessionName, 2, /linked seat 1 and seat 2/i, 15000);
-    await waitForPaneText(sessionName, 2, /\[1 -> 2\]/i, 15000);
-    await waitForPaneText(sessionName, 2, /\[2 -> 1\]/i, 15000);
-    await waitForPaneText(sessionName, 2, /relay cap \(4\)/i, 15000);
+    assert.match(statusOutput, /seat 1: running/i);
+    assert.match(statusOutput, /seat 2: running/i);
 
-    const seatOnePane = capturePane(sessionName, 0);
-    const seatTwoPane = capturePane(sessionName, 1);
-    assert.match(seatOnePane, /seat-one/i);
-    assert.match(seatTwoPane, /seat-two/i);
+    const stopOutput = execFileSync(process.execPath, [
+      cliPath,
+      "3",
+      "--session",
+      sessionName,
+      "stop",
+    ], {
+      cwd: root,
+      encoding: "utf8",
+    });
+
+    assert.match(stopOutput, /stop requested/i);
+    await Promise.all([
+      waitForExit(seatOne, 10000),
+      waitForExit(seatTwo, 10000),
+    ]);
   } finally {
-    try {
-      runTmux(["kill-session", "-t", sessionName]);
-    } catch (error) {
-      // Ignore cleanup failures.
-    }
+    safeKill(seatOne);
+    safeKill(seatTwo);
   }
 }
 
-async function warmWindow(sessionName, windowIndex, cwd) {
-  sendLine(sessionName, windowIndex, `cd ${shellQuote(cwd)}`);
-  await waitForPaneText(sessionName, windowIndex, new RegExp(escapeRegExp(cwd)), 10000);
+function waitForStream(stream, pattern, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let collected = "";
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for ${pattern}\n\n${collected}`));
+    }, timeoutMs);
+
+    const onData = (chunk) => {
+      collected += chunk.toString("utf8");
+      if (pattern.test(collected)) {
+        cleanup();
+        resolve(collected);
+      }
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      stream.off("data", onData);
+    };
+
+    stream.on("data", onData);
+  });
 }
 
-function runTmux(args) {
-  return execFileSync("tmux", args, { encoding: "utf8" });
+function waitForExit(child, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Timed out waiting for pid ${child.pid} to exit`));
+    }, timeoutMs);
+
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
 }
 
-function sendLine(sessionName, windowIndex, text) {
-  runTmux(["send-keys", "-t", `${sessionName}:${windowIndex}`, "-l", text]);
-  runTmux(["send-keys", "-t", `${sessionName}:${windowIndex}`, "Enter"]);
-}
-
-function capturePane(sessionName, windowIndex) {
-  return runTmux(["capture-pane", "-p", "-J", "-S", "-200", "-t", `${sessionName}:${windowIndex}`]);
-}
-
-async function waitForPaneText(sessionName, windowIndex, pattern, timeoutMs) {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const pane = capturePane(sessionName, windowIndex);
-    if (pattern.test(pane)) {
-      return pane;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
+function safeKill(child) {
+  if (!child || child.killed) {
+    return;
   }
-  throw new Error(`Timed out waiting for ${pattern} in ${sessionName}:${windowIndex}\n\n${capturePane(sessionName, windowIndex)}`);
-}
 
-function shellQuote(value) {
-  return `'${String(value).replace(/'/g, `'\\''`)}'`;
-}
-
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  try {
+    child.kill("SIGTERM");
+  } catch (error) {
+    // Ignore cleanup races.
+  }
 }
 
 main().catch((error) => {

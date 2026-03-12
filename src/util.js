@@ -5,18 +5,17 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const BRAND = "🔌Muuuuse";
-const POLL_MS = 900;
-const CONTROLLER_WAIT_MS = 1000;
+const POLL_MS = 250;
 const SESSION_MATCH_WINDOW_MS = 5 * 60 * 1000;
 const MAX_RELAY_CHARS = 4000;
 
 const FLAG_ALIASES = new Map([
   ["--max-relays", "maxRelays"],
-  ["--seed-seat", "seedSeat"],
-  ["--step", "step"],
+  ["--no-preset", "noPreset"],
+  ["--session", "session"],
 ]);
 
-const MULTI_FLAGS = new Set(["step"]);
+const BOOLEAN_FLAGS = new Set(["noPreset"]);
 
 function shellEscape(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
@@ -121,10 +120,6 @@ function readCommandVersion(command, args = ["--version"]) {
   return (result.stdout || result.stderr || "").trim().split("\n")[0] || null;
 }
 
-function findFirstExisting(paths) {
-  return paths.find((candidate) => fs.existsSync(candidate)) || null;
-}
-
 function stripAnsi(text) {
   return String(text || "").replace(
     // eslint-disable-next-line no-control-regex
@@ -172,8 +167,25 @@ function slugifySegment(value) {
     .replace(/^-+|-+$/g, "") || "default";
 }
 
+function hashText(text) {
+  return createHash("sha1").update(String(text || "")).digest("hex");
+}
+
 function getStateRoot() {
   return ensureDir(path.join(os.homedir(), ".muuuuse"));
+}
+
+function getDefaultSessionName(currentPath = process.cwd()) {
+  const resolvedPath = (() => {
+    try {
+      return fs.realpathSync(currentPath);
+    } catch (error) {
+      return path.resolve(currentPath);
+    }
+  })();
+
+  const label = slugifySegment(path.basename(resolvedPath));
+  return `${label}-${hashText(resolvedPath).slice(0, 8)}`;
 }
 
 function getSessionDir(sessionName) {
@@ -188,29 +200,18 @@ function getSeatPaths(sessionName, seatId) {
   const dir = getSeatDir(sessionName, seatId);
   return {
     dir,
-    metaPath: path.join(dir, "meta.json"),
-    daemonPath: path.join(dir, "daemon.json"),
-    commandsPath: path.join(dir, "commands.jsonl"),
     eventsPath: path.join(dir, "events.jsonl"),
-    scriptPath: path.join(dir, "script.json"),
+    metaPath: path.join(dir, "meta.json"),
     statusPath: path.join(dir, "status.json"),
   };
-}
-
-function getControllerPath(sessionName) {
-  return path.join(getSessionDir(sessionName), "controller.json");
-}
-
-function hashText(text) {
-  return createHash("sha1").update(String(text || "")).digest("hex");
 }
 
 function parseFlags(argv) {
   const positionals = [];
   const flags = {
-    step: [],
     maxRelays: Number.POSITIVE_INFINITY,
-    seedSeat: 1,
+    noPreset: false,
+    session: null,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -226,6 +227,11 @@ function parseFlags(argv) {
       throw new Error(`Unknown flag: ${rawFlag}`);
     }
 
+    if (BOOLEAN_FLAGS.has(key)) {
+      flags[key] = true;
+      continue;
+    }
+
     const next = inlineValue !== undefined ? inlineValue : argv[index + 1];
     if (inlineValue === undefined) {
       index += 1;
@@ -235,18 +241,12 @@ function parseFlags(argv) {
       throw new Error(`Missing value for ${rawFlag}`);
     }
 
-    if (MULTI_FLAGS.has(key)) {
-      flags[key].push(next);
-      continue;
-    }
-
     flags[key] = next;
   }
 
   flags.maxRelays = flags.maxRelays === Number.POSITIVE_INFINITY
     ? Number.POSITIVE_INFINITY
     : toInt(flags.maxRelays, Number.POSITIVE_INFINITY);
-  flags.seedSeat = toInt(flags.seedSeat, 1);
 
   return {
     positionals,
@@ -256,33 +256,31 @@ function parseFlags(argv) {
 
 function usage() {
   return [
-    `${BRAND} is the local-only 3-seat relay for Codex, Claude, Gemini, or deterministic scripts.`,
+    `${BRAND} wraps two local programs and bounces final blocks between them.`,
     "",
     "Usage:",
-    "  muuuuse 1",
-    "  muuuuse 2",
-    "  muuuuse 3 [optional kickoff prompt]",
-    "  muuuuse script [count] [--step <text>]",
-    "  muuuuse live",
+    "  muuuuse 1 <program...>",
+    "  muuuuse 2 <program...>",
+    "  muuuuse 3 stop",
+    "  muuuuse 3 status",
     "  muuuuse doctor",
     "",
-    "Flow:",
-    "  1. Run `muuuuse 1` in the first tmux terminal.",
-    "  2. Run `muuuuse 2` in the second tmux terminal.",
-    "  3. Launch Codex, Claude, Gemini, or `muuuuse script` inside those armed seats.",
-    "  4. Run `muuuuse 3` in the control terminal to auto-pair the two seats.",
+    "Examples:",
+    "  muuuuse 1 codex",
+    "  muuuuse 2 gemini",
+    "  muuuuse 3 stop",
+    "  muuuuse 1 bash -lc 'while read line; do printf \"script one: %s\\n\\n\" \"$line\"; done'",
     "",
     "Notes:",
-    "  - Visible brand: 🔌Muuuuse",
-    "  - Remote routing belongs to Codeman / codemansbot, not this package.",
-    "  - Optional kickoff: `muuuuse 3 \"Start by proposing the first concrete repo task.\"`",
-    "  - Optional script loop: `muuuuse script 4` captures four prompts and cycles them forever.",
+    "  - Seats auto-pair by current working directory by default.",
+    "  - Use `--session <name>` on seats and seat 3 if you want an explicit shared lane.",
+    "  - Known presets (`codex`, `claude`, `gemini`) expand to recommended launch flags.",
+    "  - Any other program runs as-is inside the current terminal under a PTY wrapper.",
   ].join("\n");
 }
 
 module.exports = {
   BRAND,
-  CONTROLLER_WAIT_MS,
   MAX_RELAY_CHARS,
   POLL_MS,
   SESSION_MATCH_WINDOW_MS,
@@ -290,8 +288,7 @@ module.exports = {
   commandExists,
   createId,
   ensureDir,
-  findFirstExisting,
-  getControllerPath,
+  getDefaultSessionName,
   getFileSize,
   getSeatDir,
   getSeatPaths,

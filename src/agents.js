@@ -44,6 +44,33 @@ const PRESETS = {
   },
 };
 
+function expandPresetCommand(commandTokens, usePresets = true) {
+  if (!usePresets || !Array.isArray(commandTokens) || commandTokens.length !== 1) {
+    return Array.isArray(commandTokens) ? [...commandTokens] : [];
+  }
+
+  const preset = PRESETS[String(commandTokens[0] || "").toLowerCase()];
+  return preset ? [...preset.command] : [...commandTokens];
+}
+
+function detectAgentTypeFromCommand(commandTokens) {
+  const executable = path.basename(String(commandTokens?.[0] || "")).toLowerCase();
+  if (!executable) {
+    return null;
+  }
+
+  if (executable === "codex") {
+    return "codex";
+  }
+  if (executable === "claude") {
+    return "claude";
+  }
+  if (executable === "gemini") {
+    return "gemini";
+  }
+  return null;
+}
+
 const CODEX_ROOT = path.join(os.homedir(), ".codex", "sessions");
 const CLAUDE_ROOT = path.join(os.homedir(), ".claude", "projects");
 const GEMINI_ROOT = path.join(os.homedir(), ".gemini", "tmp");
@@ -434,6 +461,8 @@ function readGeminiAnswers(filePath, lastMessageId = null) {
 module.exports = {
   PRESETS,
   detectAgent,
+  detectAgentTypeFromCommand,
+  expandPresetCommand,
   parseClaudeFinalLine,
   parseCodexFinalLine,
   readClaudeAnswers,

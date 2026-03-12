@@ -1,22 +1,26 @@
 # 🔌Muuuuse
 
-`muuuuse` installs one CLI name:
+`muuuuse` installs one CLI:
 
 - `muuuuse`
 
-The visible product brand is always `🔌Muuuuse`, while the terminal command examples use `muuuuse`.
+The public brand stays `🔌Muuuuse`. The terminal command stays `muuuuse`.
 
-## What It Does
+## What It Is Now
 
-`🔌Muuuuse` is the small local-only relay for three tmux terminals:
+`🔌Muuuuse` no longer expects you to arm a terminal first and launch something later.
 
-- seat `1` listens in one terminal
-- seat `2` listens in another terminal
-- seat `3` is the controller that auto-pairs them
+The main flow is:
 
-Once seats `1` and `2` are armed, you can launch Codex, Claude, Gemini, or a deterministic script inside those two terminals. `muuuuse 3` then relays only final answers between them by injecting text plus `Enter` into the opposite seat.
+```bash
+muuuuse 1 <program...>
+muuuuse 2 <program...>
+muuuuse 3 stop
+```
 
-Remote control is intentionally out of scope here. Use `codeman` or `codemansbot` for remote routing.
+Seat `1` and seat `2` each launch and own a real local program under a PTY wrapper. Once both seats are alive in the same lane, they automatically bounce final blocks between each other by typing the partner answer plus `Enter` into the wrapped program.
+
+`muuuuse 3 stop` is the cleanup command for that lane.
 
 ## Install
 
@@ -24,72 +28,66 @@ Remote control is intentionally out of scope here. Use `codeman` or `codemansbot
 npm install -g muuuuse
 ```
 
-## Basic Flow
+## Fastest AI Flow
 
 Terminal 1:
 
 ```bash
-muuuuse 1
-codex -m gpt-5.4 -c model_reasoning_effort=low --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+muuuuse 1 codex
 ```
 
 Terminal 2:
 
 ```bash
-muuuuse 2
-claude --dangerously-skip-permissions --permission-mode bypassPermissions
+muuuuse 2 gemini
 ```
 
 Terminal 3:
 
 ```bash
-muuuuse 3 "Start by proposing the first concrete repo task."
+muuuuse 3 stop
 ```
 
-That third command auto-pairs seats `1` and `2`, then optionally drops a one-time kickoff prompt into seat `1`.
+Known presets expand to recommended flags automatically:
 
-## Preset Launches
+- `codex`
+- `claude`
+- `gemini`
 
-`🔌Muuuuse` does not launch the CLIs for you anymore. It arms the terminal, watches the live process, and reads only final answers from the local transcript files.
+So `muuuuse 1 codex` launches the fuller Codex command, not just bare `codex`.
 
-Recommended god-mode launches:
+## Generic Program Flow
+
+This is not AI-only. Any local program can be wrapped directly.
+
+Example:
 
 ```bash
-codex -m gpt-5.4 -c model_reasoning_effort=low --dangerously-bypass-approvals-and-sandbox --no-alt-screen
-claude --dangerously-skip-permissions --permission-mode bypassPermissions
-gemini --approval-mode yolo --sandbox=false
+muuuuse 1 bash -lc 'while read line; do printf "left: %s\n\n" "$line"; done'
+muuuuse 2 bash -lc 'while read line; do printf "right: %s\n\n" "$line"; done'
 ```
 
-## Script Mode
+Type into one seat and the other seat will receive the relayed block.
 
-Turn an armed seat into a deterministic responder:
+For Codex, Claude, and Gemini, `🔌Muuuuse` prefers their structured session logs. For anything else, it falls back to the last stable output block after a turn goes idle.
+
+## Sessions
+
+Seats auto-pair by current working directory by default.
+
+If you want an explicit lane name, use:
 
 ```bash
-muuuuse script
+muuuuse 1 --session demo codex
+muuuuse 2 --session demo gemini
+muuuuse 3 --session demo stop
 ```
 
-That stores one repeating response.
-
-For a loop of multiple steps:
+You can also inspect the lane:
 
 ```bash
-muuuuse script 4
+muuuuse 3 status
 ```
-
-That collects four prompts and cycles them forever, one per inbound turn.
-
-To leave script mode and go back to a live CLI listener:
-
-```bash
-muuuuse live
-```
-
-## Requirements
-
-- `tmux`
-- `git`
-- `npm`
-- at least one local CLI you want to mirror: `codex`, `claude`, `gemini`, or script mode
 
 ## Doctor
 
@@ -97,21 +95,11 @@ muuuuse live
 muuuuse doctor
 ```
 
-This checks:
-
-- `git`
-- `npm`
-- `tmux`
-- `codex`
-- `claude`
-- `gemini`
-- `/root/npm.txt` or the fallback npm token path
+This checks the local runtime plus common agent binaries if you use them.
 
 ## Notes
 
 - local only
-- auto-pair, no auth key ceremony
-- only final answers are forwarded
-- no verbose stream forwarding
-- no reasoning forwarding
-- controller exit stops the relay
+- no tmux requirement for the main path
+- no remote control surface here; that belongs to `codeman`
+- best with programs that naturally produce turn-shaped output
