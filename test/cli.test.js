@@ -15,9 +15,10 @@ const {
     readClaudeAnswers,
     readCodexAnswers,
     readGeminiAnswers,
+    selectCodexSessionFile,
     selectSessionCandidatePath,
 } = require("../src/agents");
-const { getDefaultSessionName } = require("../src/util");
+const { buildChildEnv } = require("../src/runtime");
 
 const binPath = path.join(__dirname, "..", "bin", "muuse.js");
 const fixturePath = path.join(__dirname, "fixtures", "mock-agent.js");
@@ -32,12 +33,19 @@ async function main() {
   testGeminiParsing();
   testLateAttachFiltering();
   testSessionCandidateSelection();
+  testChildEnvScrubsOuterCodexState();
   testAgentDetection();
+  testAgentDetectionPrefersShallowCodexWrapper();
   await testCodexPidBoundSessionSelection();
+  await testCodexSeatClaimSelection();
+  testCodexWaitsInsteadOfStealingSiblingSession();
   testStatusWhenNothingIsArmed();
   await testRelayStatusStop();
   await testForgedPartnerEventsAreIgnored();
+  await testDuplicateAnswerIdsAreDeduped();
   await testMirrorRepliesDoNotPingPong();
+  await testAlternatingRepliesStopAfterSingleBounce();
+  await testQueuedRepliesAfterInboundStaySuppressed();
   await testStopSilencesBellLoop();
   process.stdout.write("muuuuse tests passed\n");
 }
@@ -286,6 +294,31 @@ function testSessionCandidateSelection() {
   ], "/root/demo", 1_000_250), null);
 }
 
+function testChildEnvScrubsOuterCodexState() {
+  const childEnv = buildChildEnv(2, "demo-session", "/tmp/demo-project", {
+    HOME: "/tmp/demo-home",
+    PATH: [
+      "/tmp/demo-home/.codex/tmp/arg0/codex-arg0shim",
+      "/usr/local/bin",
+      "/usr/bin",
+    ].join(path.delimiter),
+    TERM: "screen-256color",
+    CODEX_THREAD_ID: "outer-thread",
+    CODEX_CI: "1",
+    CODEX_MANAGED_BY_NPM: "1",
+  });
+
+  assert.equal(childEnv.CODEX_THREAD_ID, undefined);
+  assert.equal(childEnv.CODEX_CI, undefined);
+  assert.equal(childEnv.CODEX_MANAGED_BY_NPM, undefined);
+  assert.equal(childEnv.MUUUUSE_SEAT, "2");
+  assert.equal(childEnv.MUUUUSE_SESSION, "demo-session");
+  assert.equal(childEnv.PWD, "/tmp/demo-project");
+  assert.equal(childEnv.TERM, "screen-256color");
+  assert.equal(childEnv.HOME, "/tmp/demo-home");
+  assert.equal(childEnv.PATH, ["/usr/local/bin", "/usr/bin"].join(path.delimiter));
+}
+
 function testAgentDetection() {
   const detected = detectAgent([
     { pid: 11, elapsedSeconds: 9, args: "python helper.py", cwd: "/tmp/demo" },
@@ -295,6 +328,16 @@ function testAgentDetection() {
   assert.equal(detected.type, "codex");
   assert.equal(detected.pid, 22);
   assert.equal(detected.cwd, "/tmp/demo");
+}
+
+function testAgentDetectionPrefersShallowCodexWrapper() {
+  const detected = detectAgent([
+    { pid: 11, depth: 1, elapsedSeconds: 7, args: "node /usr/bin/codex --no-alt-screen", cwd: "/tmp/demo" },
+    { pid: 22, depth: 2, elapsedSeconds: 6, args: "/vendor/codex/codex --no-alt-screen", cwd: "/tmp/demo" },
+  ]);
+
+  assert.equal(detected.type, "codex");
+  assert.equal(detected.pid, 11);
 }
 
 function testStatusWhenNothingIsArmed() {
@@ -310,10 +353,13 @@ function testStatusWhenNothingIsArmed() {
 async function testRelayStatusStop() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-cwd-"));
+  const sessionNames = [];
 
   for (let cycle = 1; cycle <= 2; cycle += 1) {
-    await runRelayCycle({ cycle, cwd, home });
+    sessionNames.push(await runRelayCycle({ cycle, cwd, home }));
   }
+
+  assert.notEqual(sessionNames[0], sessionNames[1]);
 
   const statusOutput = execFileSync(process.execPath, [binPath, "status"], {
     encoding: "utf8",
@@ -366,16 +412,124 @@ async function testCodexPidBoundSessionSelection() {
   }
 }
 
+async function testCodexSeatClaimSelection() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-claim-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-claim-cwd-"));
+  const sessionName = "muuuuse-claim-demo";
+  const sessionsDir = path.join(home, ".codex", "sessions", "2026", "03", "12");
+  const snapshotsDir = path.join(home, ".codex", "shell_snapshots");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  fs.mkdirSync(snapshotsDir, { recursive: true });
+
+  const seat1Id = "019ce3a0-870e-7df2-bd11-1c7f387b6650";
+  const seat2Id = "019ce3a0-8d3f-7fe0-8558-be51fc7ff2f2";
+  const seat1Path = path.join(sessionsDir, `rollout-2026-03-12T19-57-54-${seat1Id}.jsonl`);
+  const seat2Path = path.join(sessionsDir, `rollout-2026-03-12T19-57-55-${seat2Id}.jsonl`);
+
+  for (const [filePath, id, timestamp] of [
+    [seat1Path, seat1Id, "2026-03-12T19:57:54.321Z"],
+    [seat2Path, seat2Id, "2026-03-12T19:57:55.906Z"],
+  ]) {
+    fs.writeFileSync(filePath, `${JSON.stringify({
+      type: "session_meta",
+      payload: {
+        id,
+        cwd,
+        timestamp,
+      },
+    })}\n`);
+  }
+
+  fs.writeFileSync(path.join(snapshotsDir, `${seat2Id}.sh`), [
+    'declare -x MUUUUSE_SEAT="2"',
+    `declare -x MUUUUSE_SESSION="${sessionName}"`,
+    "",
+  ].join("\n"));
+
+  const processStartedAtMs = Date.parse("2026-03-12T19:57:49.000Z");
+  const seat1Selected = execFileSync(process.execPath, [
+    "-e",
+    `
+      const { selectCodexSessionFile } = require(${JSON.stringify(path.join(__dirname, "..", "src", "agents.js"))});
+      const selected = selectCodexSessionFile(
+        ${JSON.stringify(cwd)},
+        ${processStartedAtMs},
+        { seatId: 1, sessionName: ${JSON.stringify(sessionName)} }
+      );
+      process.stdout.write(selected || "");
+    `,
+  ], {
+    encoding: "utf8",
+    env: buildEnv(home),
+  }).trim();
+
+  const seat2Selected = execFileSync(process.execPath, [
+    "-e",
+    `
+      const { selectCodexSessionFile } = require(${JSON.stringify(path.join(__dirname, "..", "src", "agents.js"))});
+      const selected = selectCodexSessionFile(
+        ${JSON.stringify(cwd)},
+        ${processStartedAtMs},
+        { seatId: 2, sessionName: ${JSON.stringify(sessionName)} }
+      );
+      process.stdout.write(selected || "");
+    `,
+  ], {
+    encoding: "utf8",
+    env: buildEnv(home),
+  }).trim();
+
+  assert.equal(seat1Selected, seat1Path);
+  assert.equal(seat2Selected, seat2Path);
+}
+
+function testCodexWaitsInsteadOfStealingSiblingSession() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-claim-wait-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-claim-wait-cwd-"));
+  const sessionName = "muuuuse-claim-wait";
+  const sessionsDir = path.join(home, ".codex", "sessions", "2026", "03", "12");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+
+  const seat1Path = path.join(sessionsDir, "rollout-2026-03-12T20-17-21-seat1.jsonl");
+  fs.writeFileSync(seat1Path, `${JSON.stringify({
+    type: "session_meta",
+    payload: {
+      id: "seat1",
+      cwd,
+      timestamp: "2026-03-12T20:17:22.040Z",
+    },
+  })}\n`);
+
+  const seat2ProcessStartedAtMs = Date.parse("2026-03-12T20:17:21.950Z");
+  const seat2Selected = execFileSync(process.execPath, [
+    "-e",
+    `
+      const { selectCodexSessionFile } = require(${JSON.stringify(path.join(__dirname, "..", "src", "agents.js"))});
+      const selected = selectCodexSessionFile(
+        ${JSON.stringify(cwd)},
+        ${seat2ProcessStartedAtMs},
+        { seatId: 2, sessionName: ${JSON.stringify(sessionName)} }
+      );
+      process.stdout.write(selected || "");
+    `,
+  ], {
+    encoding: "utf8",
+    env: buildEnv(home),
+  }).trim();
+
+  assert.equal(seat2Selected, "");
+}
+
 async function testForgedPartnerEventsAreIgnored() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-signed-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-signed-cwd-"));
-  const sessionName = getDefaultSessionName(cwd);
   const seat1 = spawnSeat(1, { cwd, home });
   const seat2 = spawnSeat(2, { cwd, home });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
     await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
 
     seat1.write(`${process.execPath} ${shellQuote(fixturePath)} codex\r`);
     seat2.write(`${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
@@ -412,16 +566,54 @@ async function testForgedPartnerEventsAreIgnored() {
   }
 }
 
-async function testMirrorRepliesDoNotPingPong() {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-mirror-home-"));
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-mirror-cwd-"));
-  const sessionName = getDefaultSessionName(cwd);
+async function testDuplicateAnswerIdsAreDeduped() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-duplicate-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-duplicate-cwd-"));
   const seat1 = spawnSeat(1, { cwd, home });
   const seat2 = spawnSeat(2, { cwd, home });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
     await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
+
+    seat1.write(`MOCK_REPLY_SEQUENCE=ONE\\|ONE ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`MOCK_REPLY_MODE=mirror ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+
+    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
+
+    seat1.write("go\r");
+
+    await seat1.waitFor(/(?:^|[\r\n])ONE(?:[\r\n]|$)/);
+    await seat2.waitFor(/(?:^|[\r\n])ONE(?:[\r\n]|$)/);
+    await sleep(1200);
+
+    const seat1Events = readAnswerEvents(home, sessionName, 1);
+    const seat2Events = readAnswerEvents(home, sessionName, 2);
+
+    assert.deepEqual(seat1Events.map((entry) => entry.text), ["ONE"]);
+    assert.equal(seat2Events.length, 0);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
+}
+
+async function testMirrorRepliesDoNotPingPong() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-mirror-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-mirror-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home });
+  const seat2 = spawnSeat(2, { cwd, home });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
 
     seat1.write(`MOCK_REPLY_MODE=mirror ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
     seat2.write(`MOCK_REPLY_MODE=mirror ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
@@ -462,6 +654,85 @@ async function testMirrorRepliesDoNotPingPong() {
 
     await seat1.waitForExit(5000);
     await seat2.waitForExit(5000);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
+}
+
+async function testAlternatingRepliesStopAfterSingleBounce() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-alternating-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-alternating-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home });
+  const seat2 = spawnSeat(2, { cwd, home });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
+
+    seat1.write(`MOCK_REPLY_TEXT=ONE ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`MOCK_REPLY_TEXT=TWO ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+
+    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
+
+    seat1.write("go\r");
+
+    await seat1.waitFor(/(?:^|[\r\n])ONE(?:[\r\n]|$)/);
+    await seat2.waitFor(/(?:^|[\r\n])ONE(?:[\r\n]|$)/);
+    await seat1.waitFor(/(?:^|[\r\n])TWO(?:[\r\n]|$)/);
+    await seat2.waitFor(/(?:^|[\r\n])TWO(?:[\r\n]|$)/);
+    await sleep(1500);
+
+    const seat1Events = readAnswerEvents(home, sessionName, 1);
+    const seat2Events = readAnswerEvents(home, sessionName, 2);
+
+    assert.deepEqual(seat1Events.map((entry) => entry.text), ["ONE"]);
+    assert.deepEqual(seat2Events.map((entry) => entry.text), ["TWO"]);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
+}
+
+async function testQueuedRepliesAfterInboundStaySuppressed() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-queued-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-queued-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home });
+  const seat2 = spawnSeat(2, { cwd, home });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
+
+    seat1.write(`MOCK_REPLY_TEXT=ONE ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`MOCK_REPLY_SEQUENCE=TWO\\|EXTRA ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+
+    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
+
+    seat1.write("go\r");
+
+    await seat1.waitFor(/(?:^|[\r\n])ONE(?:[\r\n]|$)/);
+    await seat2.waitFor(/(?:^|[\r\n])ONE(?:[\r\n]|$)/);
+    await seat1.waitFor(/(?:^|[\r\n])TWO(?:[\r\n]|$)/);
+    await sleep(1500);
+
+    const seat1Events = readAnswerEvents(home, sessionName, 1);
+    const seat2Events = readAnswerEvents(home, sessionName, 2);
+
+    assert.deepEqual(seat1Events.map((entry) => entry.text), ["ONE"]);
+    assert.deepEqual(seat2Events.map((entry) => entry.text), ["TWO"]);
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();
@@ -513,13 +784,13 @@ async function testStopSilencesBellLoop() {
 }
 
 async function runRelayCycle({ cycle, cwd, home }) {
-  const sessionName = getDefaultSessionName(cwd);
   const seat1 = spawnSeat(1, { cwd, home });
   const seat2 = spawnSeat(2, { cwd, home });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
     await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
 
     const seat1Command = cycle === 1
       ? shellQuote(noisyCodexPath)
@@ -538,22 +809,18 @@ async function runRelayCycle({ cycle, cwd, home }) {
     const prompt = cycle === 1
       ? "Reply with exactly CYCLE_ONE and nothing else."
       : `ignite cycle ${cycle}`;
-    const seat1TurnOnePattern = cycle === 1 ? /CYCLE_ONE/ : /codex turn 1:/;
-    const seat2TurnOnePattern = cycle === 1 ? /gemini turn 1: CYCLE_ONE/ : /gemini turn 1:/;
-    const seat1TurnTwoPattern = cycle === 1 ? /FINAL-2/ : /codex turn 2:/;
-    const seat2TurnTwoPattern = cycle === 1 ? /gemini turn 2: FINAL-2/ : /gemini turn 2:/;
+    const seat1LocalPattern = cycle === 1 ? /CYCLE_ONE/ : /codex turn 1:/;
+    const seat2LocalPattern = cycle === 1 ? /gemini turn 1: CYCLE_ONE/ : /gemini turn 1:/;
 
     seat1.write(`${prompt}\r`);
 
-    await seat1.waitFor(seat1TurnOnePattern);
-    await seat2.waitFor(seat2TurnOnePattern);
+    await seat1.waitFor(seat1LocalPattern);
+    await seat2.waitFor(seat2LocalPattern);
+    await seat1.waitFor(seat2LocalPattern);
 
     if (cycle === 1) {
       assert.doesNotMatch(seat2.getBuffer(), /Thinking about|Still reasoning|tool chatter/);
     }
-
-    await seat1.waitFor(seat1TurnTwoPattern);
-    await seat2.waitFor(seat2TurnTwoPattern);
 
     const statusOutput = execFileSync(process.execPath, [binPath, "status"], {
       encoding: "utf8",
@@ -571,6 +838,7 @@ async function runRelayCycle({ cycle, cwd, home }) {
     assert.match(stopOutput, /stop requested/i);
     await seat1.waitForExit(5000);
     await seat2.waitForExit(5000);
+    return sessionName;
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();
@@ -693,6 +961,31 @@ async function waitForStatus(home, cwd, pattern, timeoutMs = 15000) {
   throw new Error(`status timed out waiting for ${String(pattern)}.\n\n${finalOutput}`);
 }
 
+async function waitForSessionName(home, cwd, timeoutMs = 15000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const output = execFileSync(process.execPath, [binPath, "status"], {
+      encoding: "utf8",
+      cwd,
+      env: buildEnv(home),
+    });
+
+    const sessionName = parseFirstSessionName(output);
+    if (sessionName) {
+      return sessionName;
+    }
+
+    await sleep(100);
+  }
+
+  const finalOutput = execFileSync(process.execPath, [binPath, "status"], {
+    encoding: "utf8",
+    cwd,
+    env: buildEnv(home),
+  });
+  throw new Error(`status timed out waiting for a session name.\n\n${finalOutput}`);
+}
+
 async function waitForBuffer(getBuffer, pattern, timeoutMs, label) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -724,6 +1017,20 @@ function matches(text, pattern) {
     return pattern.test(text);
   }
   return String(text).includes(String(pattern));
+}
+
+function parseFirstSessionName(statusOutput) {
+  return String(statusOutput || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .find((line) => (
+      !line.startsWith("🔌Muuuuse") &&
+      !line.startsWith("stop requested:") &&
+      !line.startsWith("seat ") &&
+      !line.startsWith("cwd:") &&
+      !line.startsWith("log:")
+    )) || null;
 }
 
 function sleep(ms) {

@@ -10,6 +10,11 @@ const agentType = String(process.argv[2] || "codex").trim().toLowerCase();
 const startedAt = new Date().toISOString();
 const cwd = process.cwd();
 const replyMode = String(process.env.MOCK_REPLY_MODE || "prefix").trim().toLowerCase();
+const forcedReplyText = String(process.env.MOCK_REPLY_TEXT || "").trim();
+const replySequence = String(process.env.MOCK_REPLY_SEQUENCE || "")
+  .split("|")
+  .map((value) => value.trim())
+  .filter(Boolean);
 let turn = 0;
 const keepaliveFds = [];
 
@@ -28,14 +33,42 @@ rl.on("line", (line) => {
   }
 
   turn += 1;
-  const reply = replyMode === "mirror"
-    ? trimmed
-    : `${agentType} turn ${turn}: ${trimmed.slice(0, 120)}`;
-  setTimeout(() => {
-    appendAnswer(agentType, sessionFile, reply);
-    process.stdout.write(`${reply}\n`);
-  }, 120);
+  const replies = buildReplies(trimmed, turn);
+  replies.forEach((reply, index) => {
+    setTimeout(() => {
+      appendAnswer(agentType, sessionFile, reply);
+      process.stdout.write(`${reply}\n`);
+    }, 120 * (index + 1));
+  });
 });
+
+function buildReplies(trimmed, currentTurn) {
+  if (replySequence.length > 0) {
+    return replySequence.map((entry) => resolveReplyToken(entry, trimmed, currentTurn));
+  }
+
+  if (forcedReplyText) {
+    return [forcedReplyText];
+  }
+
+  if (replyMode === "mirror") {
+    return [trimmed];
+  }
+
+  return [`${agentType} turn ${currentTurn}: ${trimmed.slice(0, 120)}`];
+}
+
+function resolveReplyToken(token, trimmed, currentTurn) {
+  if (token === "$INPUT") {
+    return trimmed;
+  }
+
+  if (token === "$PREFIX") {
+    return `${agentType} turn ${currentTurn}: ${trimmed.slice(0, 120)}`;
+  }
+
+  return token;
+}
 
 function initializeSessionFile(type, currentPath, timestamp) {
   if (type === "codex") {

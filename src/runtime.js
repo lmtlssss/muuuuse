@@ -1,5 +1,6 @@
 const fs = require("node:fs");
 const { execFileSync } = require("node:child_process");
+const path = require("node:path");
 const pty = require("node-pty");
 
 const {
@@ -36,8 +37,19 @@ const {
 
 const TYPE_DELAY_MS = 70;
 const MIRROR_SUPPRESSION_WINDOW_MS = 30 * 1000;
+const PENDING_RELAY_CONTEXT_TTL_MS = 2 * 60 * 1000;
+const EMITTED_ANSWER_TTL_MS = 5 * 60 * 1000;
 const MAX_RECENT_INBOUND_RELAYS = 12;
+const MAX_RECENT_EMITTED_ANSWERS = 48;
+const MAX_RELAY_CHAIN_HOP = 1;
 const STOP_FORCE_KILL_MS = 1200;
+const SEAT_JOIN_WAIT_MS = 3000;
+const SEAT_JOIN_POLL_MS = 60;
+const CHILD_ENV_DROP_KEYS = [
+  "CODEX_CI",
+  "CODEX_MANAGED_BY_NPM",
+  "CODEX_THREAD_ID",
+];
 
 function resolveShell() {
   const shell = String(process.env.SHELL || "").trim();
@@ -52,16 +64,139 @@ function resolveShellArgs(shellPath) {
   return [];
 }
 
-function resolveChildTerm() {
-  const inherited = String(process.env.TERM || "").trim();
+function resolveChildTerm(sourceEnv = process.env) {
+  const inherited = String(sourceEnv.TERM || "").trim();
   if (inherited && inherited.toLowerCase() !== "dumb") {
     return inherited;
   }
   return "xterm-256color";
 }
 
-function resolveSessionName(currentPath = process.cwd()) {
-  return getDefaultSessionName(currentPath);
+function sanitizeChildPath(pathValue, homeDir) {
+  const arg0Root = path.join(homeDir, ".codex", "tmp", "arg0");
+  const entries = String(pathValue || "")
+    .split(path.delimiter)
+    .filter(Boolean)
+    .filter((entry) => {
+      const resolved = path.resolve(entry);
+      return resolved !== arg0Root && !resolved.startsWith(`${arg0Root}${path.sep}`);
+    });
+
+  return entries.join(path.delimiter);
+}
+
+function buildChildEnv(seatId, sessionName, cwd, baseEnv = process.env) {
+  const env = { ...baseEnv };
+  for (const key of CHILD_ENV_DROP_KEYS) {
+    delete env[key];
+  }
+
+  const homeDir = String(env.HOME || "").trim() || process.env.HOME || "/root";
+  env.PATH = sanitizeChildPath(env.PATH, homeDir);
+  env.PWD = cwd;
+  env.TERM = resolveChildTerm(baseEnv);
+  env.MUUUUSE_SEAT = String(seatId);
+  env.MUUUUSE_SESSION = sessionName;
+  return env;
+}
+
+function normalizeWorkingPath(currentPath = process.cwd()) {
+  try {
+    return fs.realpathSync(currentPath);
+  } catch {
+    return path.resolve(currentPath);
+  }
+}
+
+function matchesWorkingPath(leftPath, rightPath) {
+  if (!leftPath || !rightPath) {
+    return false;
+  }
+
+  return normalizeWorkingPath(leftPath) === normalizeWorkingPath(rightPath);
+}
+
+function createSessionName(currentPath = process.cwd()) {
+  return `${getDefaultSessionName(currentPath)}-${createId(6)}`;
+}
+
+function sleepSync(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return;
+  }
+
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function findJoinableSessionName(currentPath = process.cwd()) {
+  const candidates = listSessionNames()
+    .map((sessionName) => {
+      const sessionPaths = getSessionPaths(sessionName);
+      const controller = readJson(sessionPaths.controllerPath, null);
+      const seat1Paths = getSeatPaths(sessionName, 1);
+      const seat2Paths = getSeatPaths(sessionName, 2);
+      const seat1Meta = readJson(seat1Paths.metaPath, null);
+      const seat1Status = readJson(seat1Paths.statusPath, null);
+      const seat2Meta = readJson(seat2Paths.metaPath, null);
+      const seat2Status = readJson(seat2Paths.statusPath, null);
+      const stopRequest = readJson(sessionPaths.stopPath, null);
+
+      const cwd = controller?.cwd || seat1Status?.cwd || seat1Meta?.cwd || seat2Status?.cwd || seat2Meta?.cwd || null;
+      if (!matchesWorkingPath(cwd, currentPath)) {
+        return null;
+      }
+
+      const seat1WrapperPid = seat1Status?.pid || seat1Meta?.pid || null;
+      const seat1ChildPid = seat1Status?.childPid || seat1Meta?.childPid || null;
+      const seat2WrapperPid = seat2Status?.pid || seat2Meta?.pid || null;
+      const seat2ChildPid = seat2Status?.childPid || seat2Meta?.childPid || null;
+      const seat1Live = isPidAlive(seat1WrapperPid) || isPidAlive(seat1ChildPid);
+      const seat2Live = isPidAlive(seat2WrapperPid) || isPidAlive(seat2ChildPid);
+      const stopRequestedAtMs = Date.parse(stopRequest?.requestedAt || "");
+      const createdAtMs = Date.parse(controller?.createdAt || seat1Meta?.startedAt || seat1Status?.updatedAt || "");
+
+      if (!seat1Live || seat2Live) {
+        return null;
+      }
+
+      if (Number.isFinite(stopRequestedAtMs) && Number.isFinite(createdAtMs) && stopRequestedAtMs > createdAtMs) {
+        return null;
+      }
+
+      return {
+        sessionName,
+        createdAtMs,
+      };
+    })
+    .filter((entry) => entry !== null)
+    .sort((left, right) => right.createdAtMs - left.createdAtMs);
+
+  return candidates[0]?.sessionName || null;
+}
+
+function waitForJoinableSessionName(currentPath = process.cwd(), timeoutMs = SEAT_JOIN_WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const sessionName = findJoinableSessionName(currentPath);
+    if (sessionName) {
+      return sessionName;
+    }
+    sleepSync(SEAT_JOIN_POLL_MS);
+  }
+
+  return null;
+}
+
+function resolveSessionName(currentPath = process.cwd(), seatId = 1) {
+  if (seatId === 1) {
+    return createSessionName(currentPath);
+  }
+
+  if (seatId === 2) {
+    return waitForJoinableSessionName(currentPath);
+  }
+
+  return createSessionName(currentPath);
 }
 
 function parseAnswerEntries(text) {
@@ -121,20 +256,25 @@ function getChildProcesses(rootPid) {
       .filter((entry) => entry !== null);
 
     const descendants = [];
-    const queue = [rootPid];
-    const seen = new Set(queue);
+    const queue = [{ pid: rootPid, depth: 0 }];
+    const seen = new Set([rootPid]);
 
     while (queue.length > 0) {
-      const parentPid = queue.shift();
+      const current = queue.shift();
+      const parentPid = current.pid;
       for (const process of processes) {
         if (process.ppid !== parentPid || seen.has(process.pid)) {
           continue;
         }
         seen.add(process.pid);
-        queue.push(process.pid);
+        queue.push({
+          pid: process.pid,
+          depth: current.depth + 1,
+        });
         descendants.push({
           ...process,
           cwd: readProcessCwd(process.pid),
+          depth: current.depth + 1,
         });
       }
     }
@@ -145,14 +285,40 @@ function getChildProcesses(rootPid) {
   }
 }
 
-function resolveSessionFile(agentType, agentPid, currentPath, captureSinceMs, processStartedAtMs) {
+function getProcessFamilyPids(processes, rootPid) {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) {
+    return [];
+  }
+
+  const related = new Set([rootPid]);
+  const queue = [rootPid];
+
+  while (queue.length > 0) {
+    const parentPid = queue.shift();
+    for (const process of processes) {
+      if (process.ppid !== parentPid || related.has(process.pid)) {
+        continue;
+      }
+
+      related.add(process.pid);
+      queue.push(process.pid);
+    }
+  }
+
+  return [...related];
+}
+
+function resolveSessionFile(agentType, agentPid, currentPath, captureSinceMs, processStartedAtMs, seatContext = {}) {
   if (!currentPath) {
     return null;
   }
 
   const options = {
     pid: agentPid,
+    pids: seatContext.agentPids,
     captureSinceMs,
+    seatId: seatContext.seatId,
+    sessionName: seatContext.sessionName,
   };
 
   if (agentType === "codex") {
@@ -192,6 +358,8 @@ function buildAnswerSignaturePayload(sessionName, challenge, entry) {
     type: "muuuuse_answer",
     sessionName,
     challenge,
+    chainId: entry.chainId,
+    hop: entry.hop,
     id: entry.id,
     seatId: entry.seatId,
     origin: entry.origin,
@@ -267,8 +435,11 @@ class ArmedSeat {
   constructor(options) {
     this.seatId = options.seatId;
     this.partnerSeatId = options.seatId === 1 ? 2 : 1;
-    this.cwd = options.cwd;
-    this.sessionName = resolveSessionName(this.cwd);
+    this.cwd = normalizeWorkingPath(options.cwd);
+    this.sessionName = resolveSessionName(this.cwd, this.seatId);
+    if (!this.sessionName) {
+      throw new Error("No armed `muuuuse 1` seat is waiting in this cwd. Run `muuuuse 1` first.");
+    }
     this.sessionPaths = getSessionPaths(this.sessionName);
     this.paths = getSeatPaths(this.sessionName, this.seatId);
     this.partnerPaths = getSeatPaths(this.sessionName, this.partnerSeatId);
@@ -286,7 +457,10 @@ class ArmedSeat {
     this.resizeCleanup = null;
     this.forceKillTimer = null;
     this.identity = null;
+    this.lastUserInputAtMs = 0;
+    this.pendingInboundContext = null;
     this.recentInboundRelays = [];
+    this.recentEmittedAnswers = [];
     this.trustState = {
       challenge: null,
       peerPublicKey: null,
@@ -304,6 +478,20 @@ class ArmedSeat {
       captureSinceMs: this.startedAtMs,
       lastAnswerAt: null,
     };
+  }
+
+  writeController(extra = {}) {
+    const current = readJson(this.sessionPaths.controllerPath, {});
+    writeJson(this.sessionPaths.controllerPath, {
+      sessionName: this.sessionName,
+      cwd: this.cwd,
+      createdAt: current.createdAt || this.startedAt,
+      updatedAt: new Date().toISOString(),
+      seat1Pid: this.seatId === 1 ? process.pid : current.seat1Pid || null,
+      seat2Pid: this.seatId === 2 ? process.pid : current.seat2Pid || null,
+      pid: this.seatId === 1 ? process.pid : current.pid || null,
+      ...extra,
+    });
   }
 
   log(message) {
@@ -509,20 +697,17 @@ class ArmedSeat {
     fs.rmSync(this.paths.pipePath, { force: true });
     clearStaleStopRequest(this.sessionPaths.stopPath, this.startedAtMs);
     this.initializeTrustMaterial();
+    this.writeController();
 
     const shell = resolveShell();
     const shellArgs = resolveShellArgs(shell);
+    const childEnv = buildChildEnv(this.seatId, this.sessionName, this.cwd);
     this.child = pty.spawn(shell, shellArgs, {
       cols: process.stdout.columns || 120,
       rows: process.stdout.rows || 36,
       cwd: this.cwd,
-      env: {
-        ...process.env,
-        TERM: resolveChildTerm(),
-        MUUUUSE_SEAT: String(this.seatId),
-        MUUUUSE_SESSION: this.sessionName,
-      },
-      name: resolveChildTerm(),
+      env: childEnv,
+      name: childEnv.TERM,
     });
 
     this.childPid = this.child.pid;
@@ -547,6 +732,8 @@ class ArmedSeat {
 
   installStdinProxy() {
     const handleData = (chunk) => {
+      this.lastUserInputAtMs = Date.now();
+      this.pendingInboundContext = null;
       if (!this.child) {
         return;
       }
@@ -687,6 +874,8 @@ class ArmedSeat {
 
       const payload = sanitizeRelayText(entry.text);
       const signaturePayload = buildAnswerSignaturePayload(this.sessionName, this.trustState.challenge, {
+        chainId: entry.chainId || entry.id,
+        hop: Number.isInteger(entry.hop) ? entry.hop : 0,
         id: entry.id,
         seatId: entry.seatId,
         origin: entry.origin || "unknown",
@@ -718,6 +907,14 @@ class ArmedSeat {
         return;
       }
 
+      const deliveredAtMs = Date.now();
+      this.pendingInboundContext = {
+        chainId: entry.chainId || entry.id,
+        deliveredAtMs,
+        expiresAtMs: deliveredAtMs + PENDING_RELAY_CONTEXT_TTL_MS,
+        hop: Number.isInteger(entry.hop) ? entry.hop : 0,
+        relayUsed: false,
+      };
       this.relayCount += 1;
       this.rememberInboundRelay(payload);
       this.log(`[${this.partnerSeatId} -> ${this.seatId}] ${previewText(payload)}`);
@@ -749,6 +946,37 @@ class ArmedSeat {
     );
   }
 
+  pruneRecentEmittedAnswers(now = Date.now()) {
+    this.recentEmittedAnswers = this.recentEmittedAnswers.filter(
+      (entry) => now - entry.timestampMs <= EMITTED_ANSWER_TTL_MS
+    );
+  }
+
+  hasRecentEmittedAnswer(answerKey) {
+    if (!answerKey) {
+      return false;
+    }
+
+    this.pruneRecentEmittedAnswers();
+    return this.recentEmittedAnswers.some((entry) => entry.key === answerKey);
+  }
+
+  rememberEmittedAnswer(answerKey) {
+    if (!answerKey) {
+      return;
+    }
+
+    this.pruneRecentEmittedAnswers();
+    this.recentEmittedAnswers.push({
+      key: answerKey,
+      timestampMs: Date.now(),
+    });
+
+    if (this.recentEmittedAnswers.length > MAX_RECENT_EMITTED_ANSWERS) {
+      this.recentEmittedAnswers = this.recentEmittedAnswers.slice(-MAX_RECENT_EMITTED_ANSWERS);
+    }
+  }
+
   takeMirroredInboundRelay(payload) {
     const normalized = sanitizeRelayText(payload);
     if (!normalized) {
@@ -766,8 +994,28 @@ class ArmedSeat {
     return match;
   }
 
+  getPendingInboundContext() {
+    const context = this.pendingInboundContext;
+    if (!context) {
+      return null;
+    }
+
+    if (context.expiresAtMs <= Date.now()) {
+      this.pendingInboundContext = null;
+      return null;
+    }
+
+    if (this.lastUserInputAtMs > context.deliveredAtMs) {
+      this.pendingInboundContext = null;
+      return null;
+    }
+
+    return context;
+  }
+
   collectLiveAnswers() {
-    const detectedAgent = detectAgent(getChildProcesses(this.childPid));
+    const childProcesses = getChildProcesses(this.childPid);
+    const detectedAgent = detectAgent(childProcesses);
     if (!detectedAgent) {
       this.liveState = {
         type: null,
@@ -813,19 +1061,24 @@ class ArmedSeat {
       };
     }
 
-    if (!this.liveState.sessionFile) {
-      this.liveState.sessionFile = resolveSessionFile(
-        detectedAgent.type,
-        detectedAgent.pid,
-        currentPath,
-        this.liveState.captureSinceMs,
-        detectedAgent.processStartedAtMs
-      );
-
-      if (this.liveState.sessionFile) {
-        this.liveState.offset = 0;
-        this.liveState.lastMessageId = null;
+    const agentPids = getProcessFamilyPids(childProcesses, detectedAgent.pid);
+    const resolvedSessionFile = resolveSessionFile(
+      detectedAgent.type,
+      detectedAgent.pid,
+      currentPath,
+      this.liveState.captureSinceMs,
+      detectedAgent.processStartedAtMs,
+      {
+        agentPids,
+        seatId: this.seatId,
+        sessionName: this.sessionName,
       }
+    );
+
+    if (resolvedSessionFile && resolvedSessionFile !== this.liveState.sessionFile) {
+      this.liveState.sessionFile = resolvedSessionFile;
+      this.liveState.offset = 0;
+      this.liveState.lastMessageId = null;
     }
 
     if (!this.liveState.sessionFile) {
@@ -895,19 +1148,39 @@ class ArmedSeat {
       return;
     }
 
+    const answerKey = buildAnswerKey(entry, payload);
+    if (this.hasRecentEmittedAnswer(answerKey)) {
+      this.log(`[${this.seatId}] suppressed duplicate final answer: ${previewText(payload)}`);
+      return;
+    }
+
     const mirroredInbound = this.takeMirroredInboundRelay(payload);
     if (mirroredInbound) {
       this.log(`[${this.seatId}] suppressed mirrored relay: ${previewText(payload)}`);
       return;
     }
 
+    const pendingInboundContext = this.getPendingInboundContext();
+    if (pendingInboundContext && pendingInboundContext.hop >= MAX_RELAY_CHAIN_HOP) {
+      this.log(`[${this.seatId}] suppressed relay loop: ${previewText(payload)}`);
+      return;
+    }
+
+    if (pendingInboundContext?.relayUsed) {
+      this.log(`[${this.seatId}] suppressed extra queued relay output: ${previewText(payload)}`);
+      return;
+    }
+
+    const entryId = entry.id || createId(12);
     const signedEntry = {
-      id: entry.id || createId(12),
+      id: entryId,
       type: "answer",
       seatId: this.seatId,
       origin: entry.origin || "unknown",
       text: payload,
       createdAt: entry.createdAt || new Date().toISOString(),
+      chainId: pendingInboundContext?.chainId || entry.chainId || entryId,
+      hop: pendingInboundContext ? pendingInboundContext.hop + 1 : 0,
       challenge: this.trustState.challenge,
       publicKey: this.identity.publicKey,
     };
@@ -916,6 +1189,10 @@ class ArmedSeat {
       this.identity.privateKey
     );
     appendJsonl(this.paths.eventsPath, signedEntry);
+    this.rememberEmittedAnswer(answerKey);
+    if (pendingInboundContext) {
+      pendingInboundContext.relayUsed = true;
+    }
 
     this.log(`[${this.seatId}] ${previewText(payload)}`);
   }
@@ -1028,6 +1305,17 @@ function previewText(text, maxLength = 88) {
   return `${compact.slice(0, maxLength - 3)}...`;
 }
 
+function buildAnswerKey(entry, payload) {
+  const origin = String(entry.origin || "unknown").trim() || "unknown";
+  const id = typeof entry.id === "string" ? entry.id.trim() : "";
+  if (id) {
+    return `${origin}:${id}`;
+  }
+
+  const createdAt = typeof entry.createdAt === "string" ? entry.createdAt : "";
+  return `${origin}:${createdAt}:${hashText(payload)}`;
+}
+
 function buildSeatReport(sessionName, seatId) {
   const paths = getSeatPaths(sessionName, seatId);
   const daemon = readJson(paths.daemonPath, null);
@@ -1136,6 +1424,7 @@ function stopAllSessions() {
 
 module.exports = {
   ArmedSeat,
+  buildChildEnv,
   getStatusReport,
   resolveSessionName,
   stopAllSessions,

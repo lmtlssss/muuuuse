@@ -7,6 +7,7 @@ const readline = require("node:readline");
 
 const cwd = process.cwd();
 let turn = 0;
+let keepaliveFd = null;
 
 const dir = path.join(os.homedir(), ".codex", "sessions", "mock");
 fs.mkdirSync(dir, { recursive: true });
@@ -19,6 +20,7 @@ fs.writeFileSync(filePath, `${JSON.stringify({
     timestamp: new Date().toISOString(),
   },
 })}\n`);
+keepaliveFd = fs.openSync(filePath, "a");
 
 process.stdout.write("codex-ready\n");
 
@@ -77,3 +79,22 @@ function extractExactReply(text) {
   const match = text.match(/exactly\s+([A-Z0-9_-]+)\b/i);
   return match ? match[1] : null;
 }
+
+function closeKeepaliveFd() {
+  if (keepaliveFd == null) {
+    return;
+  }
+
+  try {
+    fs.closeSync(keepaliveFd);
+  } catch {
+    // best effort cleanup
+  }
+  keepaliveFd = null;
+}
+
+process.on("exit", closeKeepaliveFd);
+process.on("SIGTERM", () => {
+  closeKeepaliveFd();
+  process.exit(0);
+});

@@ -12,9 +12,11 @@ const {
 } = require("./util");
 
 const CODEX_ROOT = path.join(os.homedir(), ".codex", "sessions");
+const CODEX_SNAPSHOT_ROOT = path.join(os.homedir(), ".codex", "shell_snapshots");
 const CLAUDE_ROOT = path.join(os.homedir(), ".claude", "projects");
 const GEMINI_ROOT = path.join(os.homedir(), ".gemini", "tmp");
 const SESSION_START_EARLY_TOLERANCE_MS = 2 * 1000;
+const STRICT_SINGLE_CANDIDATE_EARLY_TOLERANCE_MS = 250;
 
 function walkFiles(rootPath, predicate, results = []) {
   try {
@@ -51,7 +53,11 @@ function buildDetectedAgent(type, process) {
 }
 
 function detectAgent(processes) {
-  const ordered = [...processes].sort((left, right) => left.elapsedSeconds - right.elapsedSeconds);
+  const ordered = [...processes].sort((left, right) => (
+    (left.depth ?? Number.MAX_SAFE_INTEGER) - (right.depth ?? Number.MAX_SAFE_INTEGER) ||
+    right.elapsedSeconds - left.elapsedSeconds ||
+    left.pid - right.pid
+  ));
   for (const process of ordered) {
     if (commandMatches(process.args, "codex")) {
       return buildDetectedAgent("codex", process);
@@ -93,6 +99,33 @@ function readFirstLines(filePath, maxLines = 20) {
   }
 }
 
+function sortSessionCandidates(candidates) {
+  return candidates
+    .slice()
+    .sort((left, right) => {
+      const leftDiff = Number.isFinite(left.diffMs) ? left.diffMs : Number.MAX_SAFE_INTEGER;
+      const rightDiff = Number.isFinite(right.diffMs) ? right.diffMs : Number.MAX_SAFE_INTEGER;
+      return (
+        leftDiff - rightDiff ||
+        right.startedAtMs - left.startedAtMs ||
+        right.mtimeMs - left.mtimeMs ||
+        left.path.localeCompare(right.path)
+      );
+    });
+}
+
+function annotateSessionCandidates(candidates, processStartedAtMs) {
+  return candidates.map((candidate) => ({
+    ...candidate,
+    diffMs: Number.isFinite(processStartedAtMs) && Number.isFinite(candidate.startedAtMs)
+      ? Math.abs(candidate.startedAtMs - processStartedAtMs)
+      : Number.POSITIVE_INFINITY,
+    relativeStartMs: Number.isFinite(processStartedAtMs) && Number.isFinite(candidate.startedAtMs)
+      ? candidate.startedAtMs - processStartedAtMs
+      : Number.NaN,
+  }));
+}
+
 function selectSessionCandidatePath(candidates, currentPath, processStartedAtMs) {
   const cwdMatches = candidates.filter((candidate) => candidate.cwd === currentPath);
   if (cwdMatches.length === 0) {
@@ -107,12 +140,7 @@ function selectSessionCandidatePath(candidates, currentPath, processStartedAtMs)
     return null;
   }
 
-  const preciseMatches = cwdMatches
-    .map((candidate) => ({
-      ...candidate,
-      diffMs: Math.abs(candidate.startedAtMs - processStartedAtMs),
-      relativeStartMs: candidate.startedAtMs - processStartedAtMs,
-    }))
+  const preciseMatches = annotateSessionCandidates(cwdMatches, processStartedAtMs)
     .filter((candidate) => (
       Number.isFinite(candidate.diffMs) &&
       Number.isFinite(candidate.relativeStartMs) &&
@@ -128,29 +156,98 @@ function selectSessionCandidatePath(candidates, currentPath, processStartedAtMs)
   return null;
 }
 
-function listOpenFilePaths(pid, rootPath) {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return [];
+function readCodexSeatClaim(sessionId) {
+  if (!sessionId) {
+    return null;
   }
 
-  const fdRoot = `/proc/${pid}/fd`;
+  const snapshotPath = path.join(CODEX_SNAPSHOT_ROOT, `${sessionId}.sh`);
   try {
-    const rootPrefix = path.resolve(rootPath);
-    const openPaths = fs.readdirSync(fdRoot)
-      .map((entry) => {
-        try {
-          return fs.realpathSync(path.join(fdRoot, entry));
-        } catch {
-          return null;
-        }
-      })
-      .filter((entry) => typeof entry === "string")
-      .filter((entry) => entry.startsWith(rootPrefix));
+    const text = fs.readFileSync(snapshotPath, "utf8");
+    const seatMatch = text.match(/declare -x MUUUUSE_SEAT="([^"]+)"/);
+    const sessionMatch = text.match(/declare -x MUUUUSE_SESSION="([^"]+)"/);
+    if (!seatMatch || !sessionMatch) {
+      return null;
+    }
 
-    return [...new Set(openPaths)];
+    return {
+      seatId: seatMatch[1],
+      sessionName: sessionMatch[1],
+    };
   } catch {
+    return null;
+  }
+}
+
+function selectClaimedCodexCandidatePath(candidates, options = {}) {
+  const seatId = options.seatId == null ? null : String(options.seatId);
+  const sessionName = typeof options.sessionName === "string" ? options.sessionName : null;
+  if (!seatId || !sessionName || candidates.length <= 1) {
+    return null;
+  }
+
+  const annotated = candidates.map((candidate) => ({
+    ...candidate,
+    claim: readCodexSeatClaim(candidate.sessionId),
+  }));
+
+  const exactMatches = annotated.filter((candidate) => (
+    candidate.claim?.seatId === seatId &&
+    candidate.claim?.sessionName === sessionName
+  ));
+  if (exactMatches.length === 1) {
+    return exactMatches[0].path;
+  }
+
+  const otherSeatClaims = annotated.filter((candidate) => (
+    candidate.claim?.sessionName === sessionName &&
+    candidate.claim?.seatId !== seatId
+  ));
+  if (otherSeatClaims.length === 0) {
+    return null;
+  }
+
+  const foreignPaths = new Set(otherSeatClaims.map((candidate) => candidate.path));
+  const remaining = annotated.filter((candidate) => !foreignPaths.has(candidate.path));
+  if (remaining.length === 1) {
+    return remaining[0].path;
+  }
+
+  return null;
+}
+
+function listOpenFilePathsForPids(pids, rootPath) {
+  const normalizedPids = [...new Set(
+    (Array.isArray(pids) ? pids : [pids])
+      .map((pid) => Number.parseInt(pid, 10))
+      .filter((pid) => Number.isInteger(pid) && pid > 0)
+  )];
+  if (normalizedPids.length === 0) {
     return [];
   }
+
+  const rootPrefix = path.resolve(rootPath);
+  const openPaths = new Set();
+
+  for (const pid of normalizedPids) {
+    const fdRoot = `/proc/${pid}/fd`;
+    try {
+      for (const entry of fs.readdirSync(fdRoot)) {
+        try {
+          const resolved = fs.realpathSync(path.join(fdRoot, entry));
+          if (typeof resolved === "string" && resolved.startsWith(rootPrefix)) {
+            openPaths.add(resolved);
+          }
+        } catch {
+          // Ignore descriptors that disappear while we are inspecting them.
+        }
+      }
+    } catch {
+      // Ignore pids that have already exited.
+    }
+  }
+
+  return [...openPaths];
 }
 
 function selectLiveSessionCandidatePath(candidates, currentPath, captureSinceMs = null) {
@@ -173,8 +270,8 @@ function selectLiveSessionCandidatePath(candidates, currentPath, captureSinceMs 
   return ranked[0]?.path || null;
 }
 
-function readOpenSessionCandidates(pid, rootPath, reader) {
-  return listOpenFilePaths(pid, rootPath)
+function readOpenSessionCandidates(pids, rootPath, reader) {
+  return listOpenFilePathsForPids(pids, rootPath)
     .map((filePath) => reader(filePath))
     .filter((candidate) => candidate !== null);
 }
@@ -195,6 +292,7 @@ function readCodexCandidate(filePath) {
       path: filePath,
       cwd: entry.payload.cwd,
       isSubagent: Boolean(entry.payload?.source?.subagent),
+      sessionId: entry.payload.id || null,
       startedAtMs: Date.parse(entry.payload.timestamp),
       mtimeMs: fs.statSync(filePath).mtimeMs,
     };
@@ -203,9 +301,131 @@ function readCodexCandidate(filePath) {
   }
 }
 
+function rankCodexCandidates(candidates, processStartedAtMs) {
+  return sortSessionCandidates(annotateSessionCandidates(candidates, processStartedAtMs));
+}
+
+function selectExactClaimedCodexCandidate(candidates, options = {}, processStartedAtMs = null) {
+  const seatId = options.seatId == null ? null : String(options.seatId);
+  const sessionName = typeof options.sessionName === "string" ? options.sessionName : null;
+  if (!seatId || !sessionName) {
+    return null;
+  }
+
+  const exactMatches = rankCodexCandidates(
+    candidates.filter((candidate) => {
+      const claim = readCodexSeatClaim(candidate.sessionId);
+      return claim?.seatId === seatId && claim?.sessionName === sessionName;
+    }),
+    processStartedAtMs
+  );
+
+  return exactMatches[0]?.path || null;
+}
+
+function filterForeignClaimedCodexCandidates(candidates, options = {}) {
+  const seatId = options.seatId == null ? null : String(options.seatId);
+  const sessionName = typeof options.sessionName === "string" ? options.sessionName : null;
+  if (!seatId || !sessionName) {
+    return candidates.slice();
+  }
+
+  return candidates.filter((candidate) => {
+    const claim = readCodexSeatClaim(candidate.sessionId);
+    return !(claim?.sessionName === sessionName && claim?.seatId && claim.seatId !== seatId);
+  });
+}
+
+function selectStrictSingleCodexCandidatePath(candidates, processStartedAtMs) {
+  if (candidates.length !== 1 || !Number.isFinite(processStartedAtMs)) {
+    return null;
+  }
+
+  const [candidate] = annotateSessionCandidates(candidates, processStartedAtMs);
+  if (!Number.isFinite(candidate.relativeStartMs)) {
+    return null;
+  }
+
+  if (
+    candidate.relativeStartMs < -STRICT_SINGLE_CANDIDATE_EARLY_TOLERANCE_MS ||
+    candidate.relativeStartMs > SESSION_MATCH_WINDOW_MS
+  ) {
+    return null;
+  }
+
+  return candidate.path;
+}
+
+function selectCodexCandidatePath(candidates, currentPath, processStartedAtMs, options = {}) {
+  const cwdMatches = candidates.filter((candidate) => candidate.cwd === currentPath);
+  if (cwdMatches.length === 0) {
+    return null;
+  }
+
+  const seatId = options.seatId == null ? null : String(options.seatId);
+  const sessionName = typeof options.sessionName === "string" ? options.sessionName : null;
+  const exactClaimPath = selectExactClaimedCodexCandidate(cwdMatches, options, processStartedAtMs);
+  if (exactClaimPath) {
+    return exactClaimPath;
+  }
+
+  const foreignClaimsPresent = Boolean(
+    seatId &&
+    sessionName &&
+    cwdMatches.some((candidate) => {
+      const claim = readCodexSeatClaim(candidate.sessionId);
+      return claim?.sessionName === sessionName && claim?.seatId && claim.seatId !== seatId;
+    })
+  );
+  const allowedMatches = filterForeignClaimedCodexCandidates(cwdMatches, options);
+  if (allowedMatches.length === 0) {
+    return null;
+  }
+
+  if (!Number.isFinite(processStartedAtMs)) {
+    return allowedMatches.length === 1 ? allowedMatches[0].path : null;
+  }
+
+  const preciseMatches = rankCodexCandidates(
+    allowedMatches.filter((candidate) => {
+      const annotated = annotateSessionCandidates([candidate], processStartedAtMs)[0];
+      return (
+        Number.isFinite(annotated.diffMs) &&
+        Number.isFinite(annotated.relativeStartMs) &&
+        annotated.relativeStartMs >= -SESSION_START_EARLY_TOLERANCE_MS &&
+        annotated.relativeStartMs <= SESSION_MATCH_WINDOW_MS
+      );
+    }),
+    processStartedAtMs
+  );
+
+  const preciseClaimPath = selectClaimedCodexCandidatePath(preciseMatches, options);
+  if (preciseClaimPath) {
+    return preciseClaimPath;
+  }
+
+  const pairedSeatSelection = seatId && sessionName;
+  if (pairedSeatSelection && options.allowUnclaimedSingleCandidate === false && !foreignClaimsPresent) {
+    return null;
+  }
+
+  if (preciseMatches.length === 1) {
+    return selectStrictSingleCodexCandidatePath(preciseMatches, processStartedAtMs);
+  }
+
+  if (allowedMatches.length === 1) {
+    return selectStrictSingleCodexCandidatePath(allowedMatches, processStartedAtMs);
+  }
+
+  return null;
+}
+
 function selectCodexSessionFile(currentPath, processStartedAtMs, options = {}) {
-  const liveCandidates = readOpenSessionCandidates(options.pid, CODEX_ROOT, readCodexCandidate);
-  const livePath = selectLiveSessionCandidatePath(liveCandidates, currentPath, options.captureSinceMs);
+  const liveCandidates = readOpenSessionCandidates(options.pids ?? options.pid, CODEX_ROOT, readCodexCandidate);
+  const livePath = selectCodexCandidatePath(liveCandidates, currentPath, processStartedAtMs, {
+    ...options,
+    allowUnclaimedSingleCandidate: true,
+  });
   if (livePath) {
     return livePath;
   }
@@ -214,7 +434,10 @@ function selectCodexSessionFile(currentPath, processStartedAtMs, options = {}) {
     .map((filePath) => readCodexCandidate(filePath))
     .filter((candidate) => candidate !== null);
 
-  return selectSessionCandidatePath(candidates, currentPath, processStartedAtMs);
+  return selectCodexCandidatePath(candidates, currentPath, processStartedAtMs, {
+    ...options,
+    allowUnclaimedSingleCandidate: false,
+  });
 }
 
 function extractCodexAssistantText(content) {
@@ -311,7 +534,7 @@ function readClaudeCandidate(filePath) {
 }
 
 function selectClaudeSessionFile(currentPath, processStartedAtMs, options = {}) {
-  const liveCandidates = readOpenSessionCandidates(options.pid, CLAUDE_ROOT, readClaudeCandidate);
+  const liveCandidates = readOpenSessionCandidates(options.pids ?? options.pid, CLAUDE_ROOT, readClaudeCandidate);
   const livePath = selectLiveSessionCandidatePath(liveCandidates, currentPath, options.captureSinceMs);
   if (livePath) {
     return livePath;
@@ -397,7 +620,7 @@ function readGeminiCandidate(filePath) {
 
 function selectGeminiSessionFile(currentPath, processStartedAtMs, options = {}) {
   const projectHash = createHash("sha256").update(currentPath).digest("hex");
-  const liveCandidates = readOpenSessionCandidates(options.pid, GEMINI_ROOT, readGeminiCandidate)
+  const liveCandidates = readOpenSessionCandidates(options.pids ?? options.pid, GEMINI_ROOT, readGeminiCandidate)
     .filter((candidate) => candidate.projectHash === projectHash);
   const livePath = selectLiveSessionCandidatePath(liveCandidates, projectHash, options.captureSinceMs);
   if (livePath) {
