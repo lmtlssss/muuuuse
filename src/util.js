@@ -6,6 +6,7 @@ const path = require("node:path");
 const BRAND = "🔌Muuuuse";
 const POLL_MS = 220;
 const MAX_RELAY_CHARS = 4000;
+const SESSION_MATCH_WINDOW_MS = 5 * 60 * 1000;
 
 function createId(length = 10) {
   return randomBytes(Math.ceil(length / 2)).toString("hex").slice(0, length);
@@ -144,6 +145,15 @@ function getSessionDir(sessionName) {
   return ensureDir(path.join(getStateRoot(), "sessions", slugifySegment(sessionName)));
 }
 
+function getSessionPaths(sessionName) {
+  const dir = getSessionDir(sessionName);
+  return {
+    dir,
+    controllerPath: path.join(dir, "controller.json"),
+    stopPath: path.join(dir, "stop.json"),
+  };
+}
+
 function getSeatDir(sessionName, seatId) {
   return ensureDir(path.join(getSessionDir(sessionName), `seat-${seatId}`));
 }
@@ -152,6 +162,7 @@ function getSeatPaths(sessionName, seatId) {
   const dir = getSeatDir(sessionName, seatId);
   return {
     dir,
+    daemonPath: path.join(dir, "daemon.json"),
     eventsPath: path.join(dir, "events.jsonl"),
     metaPath: path.join(dir, "meta.json"),
     pipePath: path.join(dir, "pipe.log"),
@@ -173,31 +184,39 @@ function listSessionNames() {
 
 function usage() {
   return [
-    `${BRAND} arms two raw terminals and bounces BEL-marked final output between them.`,
+    `${BRAND} arms two regular terminals and relays final answers between them.`,
     "",
     "Usage:",
     "  muuuuse 1",
     "  muuuuse 2",
     "  muuuuse stop",
+    "  muuuuse status",
     "",
     "Flow:",
     "  1. Run `muuuuse 1` in terminal one.",
     "  2. Run `muuuuse 2` in terminal two.",
     "  3. Use those armed shells normally.",
-    "  4. When a program rings the terminal bell, that final block relays to the other seat.",
-    "  5. Run `muuuuse stop` from any other shell to stop every armed seat.",
+    "  4. Codex, Claude, and Gemini final answers relay automatically from their local session logs.",
+    "  5. Run `muuuuse status` or `muuuuse stop` from any shell.",
+    "",
+    "Notes:",
+    "  - No tmux.",
+    "  - `muuuuse stop` and `muuuuse status` work from another terminal or the same one.",
+    "  - State lives under `~/.muuuuse`.",
   ].join("\n");
 }
 
 module.exports = {
   BRAND,
   POLL_MS,
+  SESSION_MATCH_WINDOW_MS,
   appendJsonl,
   createId,
   ensureDir,
   getDefaultSessionName,
   getFileSize,
   getSeatPaths,
+  getSessionPaths,
   getStateRoot,
   hashText,
   isPidAlive,

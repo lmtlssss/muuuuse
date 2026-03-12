@@ -1,36 +1,32 @@
 # 🔌Muuuuse
 
-`🔌Muuuuse` is a dead-simple terminal relay.
+`🔌Muuuuse` is a tiny no-tmux terminal relay.
 
-It does one thing:
-- arm two raw terminals
-- watch for the final BEL-marked message from whatever program is running inside them
-- inject that final message into the other armed terminal
-- keep bouncing forever until you stop it
+It does one job:
+- arm terminal one with `muuuuse 1`
+- arm terminal two with `muuuuse 2`
+- watch Codex, Claude, or Gemini for real final answers
+- inject that final answer into the other armed terminal
+- keep looping until you stop it
 
-There are only three commands:
+The whole surface is:
 
 ```bash
 muuuuse 1
 muuuuse 2
+muuuuse status
 muuuuse stop
 ```
 
-No tmux.
-No program arguments.
-No status command.
-No doctor command.
-No preset logic.
-
 ## Flow
 
-Shell 1:
+Terminal 1:
 
 ```bash
 muuuuse 1
 ```
 
-Shell 2:
+Terminal 2:
 
 ```bash
 muuuuse 2
@@ -48,38 +44,29 @@ codex
 gemini
 ```
 
-Or run any other program. `🔌Muuuuse` is program-agnostic.
+`🔌Muuuuse` tails the local session logs for supported CLIs, detects the final answer, types that answer into the other seat, and then sends Enter as a separate keystroke.
 
-When the running program rings the terminal bell, `🔌Muuuuse` takes the final output block for that turn and injects it into the partner seat.
+Check the live state from any terminal:
 
-Stop the whole loop from any other shell:
+```bash
+muuuuse status
+```
+
+Stop the loop from any terminal, including one of the armed shells once it is back at a prompt:
 
 ```bash
 muuuuse stop
 ```
+
+## Notes
+
+- no tmux
+- state lives under `~/.muuuuse`
+- supported final-answer detection is built for Codex, Claude, and Gemini
+- `codeman` remains the larger transport/control layer; `muuuuse` stays local and minimal
 
 ## Install
 
 ```bash
 npm install -g muuuuse
 ```
-
-## What Counts As A Relay
-
-`🔌Muuuuse` watches the armed terminal output for BEL (`\u0007`).
-
-That BEL marks the end of a turn.
-
-When it sees BEL, it:
-1. grabs the final output block since the last submitted input
-2. cleans the block
-3. appends it to the seat event log
-4. injects it into the other armed terminal followed by Enter
-
-## Notes
-
-- local only
-- seat pairing defaults by current working directory
-- state lives under `~/.muuuuse`
-- `codeman` remains the richer transport layer
-- `🔌Muuuuse` is the tiny relay protocol

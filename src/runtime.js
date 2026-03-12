@@ -1,7 +1,16 @@
 const fs = require("node:fs");
-const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 const pty = require("node-pty");
 
+const {
+  detectAgent,
+  readClaudeAnswers,
+  readCodexAnswers,
+  readGeminiAnswers,
+  selectClaudeSessionFile,
+  selectCodexSessionFile,
+  selectGeminiSessionFile,
+} = require("./agents");
 const {
   BRAND,
   POLL_MS,
@@ -11,7 +20,7 @@ const {
   getDefaultSessionName,
   getFileSize,
   getSeatPaths,
-  getStateRoot,
+  getSessionPaths,
   hashText,
   isPidAlive,
   listSessionNames,
@@ -22,8 +31,10 @@ const {
   writeJson,
 } = require("./util");
 
-const BELL = "\u0007";
-const CTRL_C = "\u0003";
+const TYPE_DELAY_MS = 70;
+const MIRROR_SUPPRESSION_WINDOW_MS = 30 * 1000;
+const MAX_RECENT_INBOUND_RELAYS = 12;
+const STOP_FORCE_KILL_MS = 1200;
 
 function resolveShell() {
   const shell = String(process.env.SHELL || "").trim();
@@ -31,9 +42,9 @@ function resolveShell() {
 }
 
 function resolveShellArgs(shellPath) {
-  const base = path.basename(shellPath);
-  if (base === "bash" || base === "zsh") {
-    return ["-l"];
+  const base = shellPath.split("/").pop();
+  if (base === "bash" || base === "zsh" || base === "fish") {
+    return ["-i"];
   }
   return [];
 }
@@ -48,81 +59,6 @@ function resolveChildTerm() {
 
 function resolveSessionName(currentPath = process.cwd()) {
   return getDefaultSessionName(currentPath);
-}
-
-class BellRelayTracker {
-  constructor() {
-    this.active = false;
-    this.buffer = "";
-    this.lastInputText = "";
-    this.lastFingerprint = null;
-  }
-
-  noteTurnStart(inputText = "") {
-    this.active = true;
-    this.buffer = "";
-    this.lastInputText = sanitizeRelayText(inputText, 12000);
-  }
-
-  append(data) {
-    const text = String(data || "");
-    if (!text || !this.active) {
-      return [];
-    }
-
-    const answers = [];
-    for (const char of text) {
-      if (char === BELL) {
-        const answer = extractFinalBlock(this.buffer, this.lastInputText);
-        this.buffer = "";
-        this.active = false;
-        if (!answer) {
-          continue;
-        }
-        const fingerprint = hashText(`${this.lastInputText}\n${answer}`);
-        if (fingerprint === this.lastFingerprint) {
-          continue;
-        }
-        this.lastFingerprint = fingerprint;
-        answers.push(answer);
-        continue;
-      }
-
-      this.buffer += char;
-      if (this.buffer.length > 24000) {
-        this.buffer = this.buffer.slice(-24000);
-      }
-    }
-
-    return answers;
-  }
-}
-
-function extractFinalBlock(rawText, lastInputText) {
-  let candidate = sanitizeRelayText(rawText, 12000);
-  if (!candidate) {
-    return null;
-  }
-
-  if (lastInputText) {
-    if (candidate === lastInputText) {
-      return null;
-    }
-    if (candidate.startsWith(`${lastInputText}\n`)) {
-      candidate = candidate.slice(lastInputText.length).trim();
-    }
-  }
-
-  const blocks = candidate
-    .split(/\n{2,}/)
-    .map((block) => block.trim())
-    .filter(Boolean);
-
-  if (blocks.length === 0) {
-    return null;
-  }
-
-  return sanitizeRelayText(blocks[blocks.length - 1]);
 }
 
 function parseAnswerEntries(text) {
@@ -140,27 +76,168 @@ function parseAnswerEntries(text) {
     .filter((entry) => entry && entry.type === "answer" && typeof entry.text === "string");
 }
 
+function readProcessCwd(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+
+  try {
+    return fs.realpathSync(`/proc/${pid}/cwd`);
+  } catch {
+    return null;
+  }
+}
+
+function getChildProcesses(rootPid) {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) {
+    return [];
+  }
+
+  try {
+    const output = execFileSync("ps", ["-axo", "pid=,ppid=,etimes=,command="], {
+      encoding: "utf8",
+    });
+
+    const processes = output
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map((line) => {
+        const match = line.match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/);
+        if (!match) {
+          return null;
+        }
+
+        return {
+          pid: Number.parseInt(match[1], 10),
+          ppid: Number.parseInt(match[2], 10),
+          elapsedSeconds: Number.parseInt(match[3], 10),
+          args: match[4],
+        };
+      })
+      .filter((entry) => entry !== null);
+
+    const descendants = [];
+    const queue = [rootPid];
+    const seen = new Set(queue);
+
+    while (queue.length > 0) {
+      const parentPid = queue.shift();
+      for (const process of processes) {
+        if (process.ppid !== parentPid || seen.has(process.pid)) {
+          continue;
+        }
+        seen.add(process.pid);
+        queue.push(process.pid);
+        descendants.push({
+          ...process,
+          cwd: readProcessCwd(process.pid),
+        });
+      }
+    }
+
+    return descendants.sort((left, right) => left.elapsedSeconds - right.elapsedSeconds);
+  } catch {
+    return [];
+  }
+}
+
+function resolveSessionFile(agentType, currentPath, processStartedAtMs) {
+  if (!currentPath) {
+    return null;
+  }
+
+  if (agentType === "codex") {
+    return selectCodexSessionFile(currentPath, processStartedAtMs);
+  }
+  if (agentType === "claude") {
+    return selectClaudeSessionFile(currentPath, processStartedAtMs);
+  }
+  if (agentType === "gemini") {
+    return selectGeminiSessionFile(currentPath, processStartedAtMs);
+  }
+  return null;
+}
+
+async function sendTextAndEnter(child, text, shouldAbort = () => false) {
+  const lines = String(text || "").replace(/\r/g, "").split("\n");
+
+  for (let index = 0; index < lines.length; index += 1) {
+    if (shouldAbort() || !child) {
+      return false;
+    }
+
+    const line = lines[index];
+    if (line.length > 0) {
+      try {
+        child.write(line);
+      } catch {
+        return false;
+      }
+      await sleep(TYPE_DELAY_MS);
+    }
+
+    if (index < lines.length - 1) {
+      if (shouldAbort()) {
+        return false;
+      }
+
+      try {
+        child.write("\r");
+      } catch {
+        return false;
+      }
+      await sleep(TYPE_DELAY_MS);
+    }
+  }
+
+  if (shouldAbort() || !child) {
+    return false;
+  }
+
+  try {
+    child.write("\r");
+  } catch {
+    return false;
+  }
+
+  return true;
+}
+
 class ArmedSeat {
   constructor(options) {
     this.seatId = options.seatId;
     this.partnerSeatId = options.seatId === 1 ? 2 : 1;
     this.cwd = options.cwd;
     this.sessionName = resolveSessionName(this.cwd);
+    this.sessionPaths = getSessionPaths(this.sessionName);
     this.paths = getSeatPaths(this.sessionName, this.seatId);
     this.partnerPaths = getSeatPaths(this.sessionName, this.partnerSeatId);
     this.partnerOffset = getFileSize(this.partnerPaths.eventsPath);
 
     this.child = null;
     this.childPid = null;
-    this.childPgid = null;
     this.childExit = null;
     this.startedAt = new Date().toISOString();
+    this.startedAtMs = Date.now();
     this.relayCount = 0;
-    this.pendingInput = "";
     this.stopped = false;
+    this.stopReason = null;
     this.stdinCleanup = null;
     this.resizeCleanup = null;
-    this.tracker = new BellRelayTracker();
+    this.forceKillTimer = null;
+    this.recentInboundRelays = [];
+    this.liveState = {
+      type: null,
+      pid: null,
+      currentPath: null,
+      sessionFile: null,
+      offset: 0,
+      lastMessageId: null,
+      processStartedAtMs: null,
+      captureSinceMs: this.startedAtMs,
+      lastAnswerAt: null,
+    };
   }
 
   log(message) {
@@ -198,6 +275,7 @@ class ArmedSeat {
   launchShell() {
     ensureDir(this.paths.dir);
     fs.rmSync(this.paths.pipePath, { force: true });
+    clearStaleStopRequest(this.sessionPaths.stopPath, this.startedAtMs);
 
     const shell = resolveShell();
     const shellArgs = resolveShellArgs(shell);
@@ -215,16 +293,13 @@ class ArmedSeat {
     });
 
     this.childPid = this.child.pid;
-    this.childPgid = this.child.pid;
     this.writeMeta();
     this.writeStatus({ state: "running" });
 
     this.child.onData((data) => {
       fs.appendFileSync(this.paths.pipePath, data);
-      process.stdout.write(data);
-      const answers = this.tracker.append(data);
-      for (const answer of answers) {
-        this.emitAnswer(answer);
+      if (!this.stopped) {
+        process.stdout.write(data);
       }
     });
 
@@ -239,10 +314,7 @@ class ArmedSeat {
       if (!this.child) {
         return;
       }
-
-      const text = chunk.toString("utf8");
-      this.child.write(text);
-      this.trackInput(text);
+      this.child.write(chunk.toString("utf8"));
     };
 
     const handleEnd = () => {
@@ -292,32 +364,59 @@ class ArmedSeat {
 
   installStopSignals() {
     const requestStop = () => {
-      this.stopped = true;
+      this.requestStop("signal");
     };
 
     process.on("SIGTERM", requestStop);
     process.on("SIGHUP", requestStop);
   }
 
-  trackInput(text) {
-    for (const char of String(text || "")) {
-      if (char === CTRL_C) {
-        this.pendingInput = "";
-        this.tracker.noteTurnStart("");
-        continue;
+  requestStop(reason = "stop_requested") {
+    if (this.stopped) {
+      return;
+    }
+
+    this.stopped = true;
+    this.stopReason = reason;
+
+    if (this.childPid) {
+      signalProcessFamily(this.childPid, "SIGHUP");
+      signalProcessFamily(this.childPid, "SIGTERM");
+      this.scheduleForcedKill();
+    }
+
+    if (this.child && !this.childExit) {
+      try {
+        this.child.kill();
+      } catch {
+        // best effort shutdown
+      }
+    }
+  }
+
+  scheduleForcedKill() {
+    if (this.forceKillTimer || !this.childPid) {
+      return;
+    }
+
+    this.forceKillTimer = setTimeout(() => {
+      this.forceKillTimer = null;
+      if (!this.childPid || this.childExit) {
+        return;
       }
 
-      if (char === "\r" || char === "\n") {
-        const submitted = sanitizeRelayText(this.pendingInput, 12000);
-        this.pendingInput = "";
-        this.tracker.noteTurnStart(submitted);
-        continue;
+      signalProcessFamily(this.childPid, "SIGKILL");
+      if (this.child && !this.childExit) {
+        try {
+          this.child.kill();
+        } catch {
+          // best effort hard shutdown
+        }
       }
+    }, STOP_FORCE_KILL_MS);
 
-      this.pendingInput += char;
-      if (this.pendingInput.length > 4000) {
-        this.pendingInput = this.pendingInput.slice(-4000);
-      }
+    if (typeof this.forceKillTimer.unref === "function") {
+      this.forceKillTimer.unref();
     }
   }
 
@@ -326,50 +425,271 @@ class ArmedSeat {
     return Boolean(partner?.pid && isPidAlive(partner.pid));
   }
 
-  pullPartnerEvents() {
+  stopRequested() {
+    const request = readJson(this.sessionPaths.stopPath, null);
+    if (!request?.requestedAt) {
+      return false;
+    }
+
+    const requestedAtMs = Date.parse(request.requestedAt);
+    return Number.isFinite(requestedAtMs) && requestedAtMs > this.startedAtMs;
+  }
+
+  async pullPartnerEvents() {
     const { nextOffset, text } = readAppendedText(this.partnerPaths.eventsPath, this.partnerOffset);
     this.partnerOffset = nextOffset;
-    if (!text.trim()) {
+    if (!text.trim() || !this.child || this.stopped) {
       return;
     }
 
     const entries = parseAnswerEntries(text);
     for (const entry of entries) {
+      if (this.stopped || this.stopRequested()) {
+        this.requestStop("stop_requested");
+        return;
+      }
+
       const payload = sanitizeRelayText(entry.text);
-      if (!payload || !this.child) {
+      if (!payload) {
         continue;
       }
 
-      this.tracker.noteTurnStart(payload);
-      this.child.write(payload.replace(/\n/g, "\r"));
-      this.child.write("\r");
+      const delivered = await sendTextAndEnter(
+        this.child,
+        payload,
+        () => this.stopped || this.stopRequested() || !this.child || Boolean(this.childExit)
+      );
+      if (!delivered) {
+        this.requestStop("relay_aborted");
+        return;
+      }
+
+      if (this.stopped || this.stopRequested()) {
+        this.requestStop("stop_requested");
+        return;
+      }
+
       this.relayCount += 1;
+      this.rememberInboundRelay(payload);
       this.log(`[${this.partnerSeatId} -> ${this.seatId}] ${previewText(payload)}`);
     }
   }
 
-  emitAnswer(text) {
+  rememberInboundRelay(text) {
     const payload = sanitizeRelayText(text);
     if (!payload) {
       return;
     }
 
+    const now = Date.now();
+    this.pruneRecentInboundRelays(now);
+    this.recentInboundRelays.push({
+      hash: hashText(payload),
+      text: payload,
+      timestampMs: now,
+    });
+
+    if (this.recentInboundRelays.length > MAX_RECENT_INBOUND_RELAYS) {
+      this.recentInboundRelays = this.recentInboundRelays.slice(-MAX_RECENT_INBOUND_RELAYS);
+    }
+  }
+
+  pruneRecentInboundRelays(now = Date.now()) {
+    this.recentInboundRelays = this.recentInboundRelays.filter(
+      (entry) => now - entry.timestampMs <= MIRROR_SUPPRESSION_WINDOW_MS
+    );
+  }
+
+  takeMirroredInboundRelay(payload) {
+    const normalized = sanitizeRelayText(payload);
+    if (!normalized) {
+      return null;
+    }
+
+    this.pruneRecentInboundRelays();
+    const payloadHash = hashText(normalized);
+    const matchIndex = this.recentInboundRelays.findIndex((entry) => entry.hash === payloadHash);
+    if (matchIndex === -1) {
+      return null;
+    }
+
+    const [match] = this.recentInboundRelays.splice(matchIndex, 1);
+    return match;
+  }
+
+  collectLiveAnswers() {
+    const detectedAgent = detectAgent(getChildProcesses(this.childPid));
+    if (!detectedAgent) {
+      this.liveState = {
+        type: null,
+        pid: null,
+        currentPath: null,
+        sessionFile: null,
+        offset: 0,
+        lastMessageId: null,
+        processStartedAtMs: null,
+        captureSinceMs: this.startedAtMs,
+        lastAnswerAt: null,
+      };
+
+      return {
+        state: this.childExit ? "exited" : "running",
+        agent: null,
+        cwd: this.cwd,
+        log: null,
+        lastAnswerAt: null,
+      };
+    }
+
+    const currentPath = detectedAgent.cwd || this.cwd;
+    const changed =
+      this.liveState.type !== detectedAgent.type ||
+      this.liveState.pid !== detectedAgent.pid ||
+      this.liveState.currentPath !== currentPath;
+
+    if (changed) {
+      this.liveState = {
+        type: detectedAgent.type,
+        pid: detectedAgent.pid,
+        currentPath,
+        sessionFile: null,
+        offset: 0,
+        lastMessageId: null,
+        processStartedAtMs: detectedAgent.processStartedAtMs,
+        captureSinceMs: Math.max(
+          this.startedAtMs,
+          Number.isFinite(detectedAgent.processStartedAtMs) ? detectedAgent.processStartedAtMs : 0
+        ),
+        lastAnswerAt: null,
+      };
+    }
+
+    if (!this.liveState.sessionFile) {
+      this.liveState.sessionFile = resolveSessionFile(
+        detectedAgent.type,
+        currentPath,
+        detectedAgent.processStartedAtMs
+      );
+
+      if (this.liveState.sessionFile) {
+        this.liveState.offset = 0;
+        this.liveState.lastMessageId = null;
+      }
+    }
+
+    if (!this.liveState.sessionFile) {
+      return {
+        state: "running",
+        agent: detectedAgent.type,
+        cwd: currentPath,
+        log: "waiting_for_session_log",
+        lastAnswerAt: this.liveState.lastAnswerAt,
+      };
+    }
+
+    const answers = [];
+    if (detectedAgent.type === "codex") {
+      const result = readCodexAnswers(
+        this.liveState.sessionFile,
+        this.liveState.offset,
+        this.liveState.captureSinceMs
+      );
+      this.liveState.offset = result.nextOffset;
+      answers.push(...result.answers);
+    } else if (detectedAgent.type === "claude") {
+      const result = readClaudeAnswers(
+        this.liveState.sessionFile,
+        this.liveState.offset,
+        this.liveState.captureSinceMs
+      );
+      this.liveState.offset = result.nextOffset;
+      answers.push(...result.answers);
+    } else if (detectedAgent.type === "gemini") {
+      const result = readGeminiAnswers(
+        this.liveState.sessionFile,
+        this.liveState.lastMessageId,
+        this.liveState.captureSinceMs
+      );
+      this.liveState.lastMessageId = result.lastMessageId;
+      this.liveState.offset = result.fileSize;
+      answers.push(...result.answers);
+    }
+
+    for (const answer of answers) {
+      this.emitAnswer({
+        id: answer.id || createId(12),
+        origin: detectedAgent.type,
+        text: answer.text,
+        createdAt: answer.timestamp || new Date().toISOString(),
+      });
+      this.liveState.lastAnswerAt = answer.timestamp || new Date().toISOString();
+    }
+
+    return {
+      state: "running",
+      agent: detectedAgent.type,
+      cwd: currentPath,
+      log: this.liveState.sessionFile,
+      lastAnswerAt: this.liveState.lastAnswerAt,
+    };
+  }
+
+  emitAnswer(entry) {
+    if (this.stopped) {
+      return;
+    }
+
+    const payload = sanitizeRelayText(entry.text);
+    if (!payload) {
+      return;
+    }
+
+    const mirroredInbound = this.takeMirroredInboundRelay(payload);
+    if (mirroredInbound) {
+      this.log(`[${this.seatId}] suppressed mirrored relay: ${previewText(payload)}`);
+      return;
+    }
+
     appendJsonl(this.paths.eventsPath, {
-      id: createId(12),
+      id: entry.id || createId(12),
       type: "answer",
       seatId: this.seatId,
+      origin: entry.origin || "unknown",
       text: payload,
-      createdAt: new Date().toISOString(),
+      createdAt: entry.createdAt || new Date().toISOString(),
     });
 
     this.log(`[${this.seatId}] ${previewText(payload)}`);
   }
 
   async tick() {
-    this.pullPartnerEvents();
+    if (this.stopRequested()) {
+      this.writeStatus({
+        state: "stopping",
+        partnerLive: this.partnerIsLive(),
+      });
+      this.requestStop("stop_requested");
+      return;
+    }
+
+    await this.pullPartnerEvents();
+    if (this.stopped || this.stopRequested()) {
+      this.requestStop("stop_requested");
+      return;
+    }
+
+    const live = this.collectLiveAnswers();
+    if (this.stopped) {
+      return;
+    }
+
     this.writeStatus({
+      state: live.state,
+      agent: live.agent,
+      cwd: live.cwd,
+      log: live.log,
+      lastAnswerAt: live.lastAnswerAt,
       partnerLive: this.partnerIsLive(),
-      state: this.childExit ? "exited" : "running",
     });
   }
 
@@ -380,8 +700,8 @@ class ArmedSeat {
     this.installResizeHandler();
 
     this.log(`${BRAND} seat ${this.seatId} armed for ${this.sessionName}.`);
-    this.log("Use this shell normally. When a program rings the terminal bell, the final block relays to the partner seat.");
-    this.log("Run `muuuuse stop` from any other shell to stop the loop.");
+    this.log("Use this shell normally. Codex, Claude, and Gemini final answers relay automatically from their local session logs.");
+    this.log("Run `muuuuse status` or `muuuuse stop` from any terminal.");
 
     try {
       while (!this.stopped) {
@@ -396,6 +716,11 @@ class ArmedSeat {
   }
 
   cleanup() {
+    if (this.forceKillTimer) {
+      clearTimeout(this.forceKillTimer);
+      this.forceKillTimer = null;
+    }
+
     if (this.stdinCleanup) {
       this.stdinCleanup();
       this.stdinCleanup = null;
@@ -405,10 +730,13 @@ class ArmedSeat {
       this.resizeCleanup = null;
     }
 
-    stopTrackedSeat({
-      childPid: this.childPid,
-      wrapperPid: process.pid,
-    });
+    if (this.child && !this.childExit) {
+      try {
+        this.child.kill();
+      } catch {
+        // best effort
+      }
+    }
 
     this.writeMeta({
       childPid: this.childPid,
@@ -430,10 +758,125 @@ function previewText(text, maxLength = 88) {
   return `${compact.slice(0, maxLength - 3)}...`;
 }
 
+function buildSeatReport(sessionName, seatId) {
+  const paths = getSeatPaths(sessionName, seatId);
+  const daemon = readJson(paths.daemonPath, null);
+  const status = readJson(paths.statusPath, null);
+  const meta = readJson(paths.metaPath, null);
+
+  if (!status && !meta && !daemon) {
+    return null;
+  }
+
+  const legacyTmux = Boolean(daemon?.pid || meta?.paneId);
+  const wrapperPid = status?.pid || daemon?.pid || meta?.pid || null;
+  const childPid = status?.childPid || meta?.childPid || null;
+  const wrapperLive = isPidAlive(wrapperPid);
+  const childLive = isPidAlive(childPid);
+
+  if (!wrapperLive && !childLive) {
+    return null;
+  }
+
+  return {
+    seatId,
+    state: wrapperLive ? status?.state || "running" : "orphaned_child",
+    wrapperPid,
+    childPid,
+    wrapperLive,
+    childLive,
+    legacyTmux,
+    agent: status?.agent || null,
+    cwd: status?.cwd || meta?.cwd || null,
+    relayCount: status?.relayCount || 0,
+    log: status?.log || null,
+    startedAt: meta?.startedAt || null,
+    updatedAt: status?.updatedAt || null,
+    lastAnswerAt: status?.lastAnswerAt || null,
+    partnerLive: Boolean(status?.partnerLive),
+  };
+}
+
+function getStatusReport() {
+  const sessions = listSessionNames()
+    .map((sessionName) => {
+      const sessionPaths = getSessionPaths(sessionName);
+      const controller = readJson(sessionPaths.controllerPath, null);
+      const stopRequest = readJson(sessionPaths.stopPath, null);
+      const seats = [1, 2]
+        .map((seatId) => buildSeatReport(sessionName, seatId))
+        .filter((entry) => entry !== null);
+
+      const controllerPid = controller?.pid || null;
+      const controllerLive = isPidAlive(controllerPid);
+
+      if (seats.length === 0 && !controllerLive) {
+        return null;
+      }
+
+      const stopRequestedAt = selectVisibleStopRequest(stopRequest?.requestedAt, seats);
+
+      return {
+        sessionName,
+        controllerPid,
+        controllerLive,
+        stopRequestedAt,
+        seats,
+      };
+    })
+    .filter((entry) => entry !== null);
+
+  return { sessions };
+}
+
+function stopAllSessions() {
+  const report = getStatusReport();
+  const requestedAt = new Date().toISOString();
+
+  for (const session of report.sessions) {
+    const sessionPaths = getSessionPaths(session.sessionName);
+    writeJson(sessionPaths.stopPath, {
+      requestId: createId(12),
+      requestedAt,
+    });
+
+    if (session.controllerLive) {
+      signalPid(session.controllerPid, "SIGTERM");
+    }
+
+    for (const seat of session.seats) {
+      if (seat.childLive) {
+        signalProcessFamily(seat.childPid, "SIGHUP");
+        signalProcessFamily(seat.childPid, "SIGTERM");
+        if (!seat.wrapperLive) {
+          signalProcessFamily(seat.childPid, "SIGKILL");
+        }
+      }
+
+      if (seat.wrapperLive) {
+        signalPid(seat.wrapperPid, "SIGTERM");
+      }
+    }
+  }
+
+  return {
+    requestedAt,
+    sessions: report.sessions,
+  };
+}
+
+module.exports = {
+  ArmedSeat,
+  getStatusReport,
+  resolveSessionName,
+  stopAllSessions,
+};
+
 function signalPid(pid, signal) {
   if (!Number.isInteger(pid) || pid <= 0 || !isPidAlive(pid)) {
     return false;
   }
+
   try {
     process.kill(pid, signal);
     return true;
@@ -442,57 +885,77 @@ function signalPid(pid, signal) {
   }
 }
 
-function stopTrackedSeat({ wrapperPid = null, childPid = null }) {
-  const childStopped = signalPid(childPid, "SIGTERM");
-  const wrapperStopped = wrapperPid === process.pid ? false : signalPid(wrapperPid, "SIGTERM");
-  return { childStopped, wrapperStopped };
+function signalProcessTree(rootPid, signal) {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) {
+    return 0;
+  }
+
+  let delivered = 0;
+  for (const process of getChildProcesses(rootPid)) {
+    if (signalPid(process.pid, signal)) {
+      delivered += 1;
+    }
+  }
+
+  if (signalPid(rootPid, signal)) {
+    delivered += 1;
+  }
+
+  return delivered;
 }
 
-function stopSession(sessionName) {
-  const seats = [1, 2]
-    .map((seatId) => {
-      const paths = getSeatPaths(sessionName, seatId);
-      const status = readJson(paths.statusPath, null);
-      const wrapperPid = status?.pid || null;
-      const childPid = status?.childPid || null;
-      const wrapperLive = isPidAlive(wrapperPid);
-      const childLive = isPidAlive(childPid);
+function signalProcessGroup(rootPid, signal) {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) {
+    return false;
+  }
 
-      if (!wrapperLive && !childLive) {
-        return null;
-      }
+  try {
+    process.kill(-rootPid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-      const result = stopTrackedSeat({ wrapperPid, childPid });
-      writeJson(paths.statusPath, {
-        ...(status || {}),
-        state: "stopping",
-        updatedAt: new Date().toISOString(),
-      });
+function signalProcessFamily(rootPid, signal) {
+  let delivered = 0;
+  if (signalProcessGroup(rootPid, signal)) {
+    delivered += 1;
+  }
+  delivered += signalProcessTree(rootPid, signal);
+  return delivered;
+}
 
-      return {
-        seatId,
-        wrapperStopped: result.wrapperStopped,
-        childStopped: result.childStopped,
-      };
-    })
-    .filter(Boolean);
+function clearStaleStopRequest(stopPath, startedAtMs) {
+  const request = readJson(stopPath, null);
+  if (!request?.requestedAt) {
+    return;
+  }
 
-  if (seats.length === 0) {
+  const requestedAtMs = Date.parse(request.requestedAt);
+  if (Number.isFinite(requestedAtMs) && requestedAtMs <= startedAtMs) {
+    fs.rmSync(stopPath, { force: true });
+  }
+}
+
+function selectVisibleStopRequest(requestedAt, seats) {
+  if (!requestedAt) {
     return null;
   }
 
-  return { sessionName, seats };
-}
+  const requestedAtMs = Date.parse(requestedAt);
+  if (!Number.isFinite(requestedAtMs)) {
+    return null;
+  }
 
-function stopAllSessions() {
-  const sessions = listSessionNames()
-    .map((sessionName) => stopSession(sessionName))
-    .filter(Boolean);
-  return { sessions };
-}
+  const newestStartedAtMs = seats
+    .map((seat) => Date.parse(seat.startedAt || ""))
+    .filter((value) => Number.isFinite(value))
+    .sort((left, right) => right - left)[0];
 
-module.exports = {
-  ArmedSeat,
-  resolveSessionName,
-  stopAllSessions,
-};
+  if (Number.isFinite(newestStartedAtMs) && requestedAtMs <= newestStartedAtMs) {
+    return null;
+  }
+
+  return requestedAt;
+}

@@ -1,0 +1,125 @@
+#!/usr/bin/env node
+
+const { createHash } = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const readline = require("node:readline");
+
+const agentType = String(process.argv[2] || "codex").trim().toLowerCase();
+const startedAt = new Date().toISOString();
+const cwd = process.cwd();
+const replyMode = String(process.env.MOCK_REPLY_MODE || "prefix").trim().toLowerCase();
+let turn = 0;
+
+const sessionFile = initializeSessionFile(agentType, cwd, startedAt);
+process.stdout.write(`${agentType}-ready\n`);
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  crlfDelay: Infinity,
+});
+
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  turn += 1;
+  const reply = replyMode === "mirror"
+    ? trimmed
+    : `${agentType} turn ${turn}: ${trimmed.slice(0, 120)}`;
+  setTimeout(() => {
+    appendAnswer(agentType, sessionFile, reply);
+    process.stdout.write(`${reply}\n`);
+  }, 120);
+});
+
+function initializeSessionFile(type, currentPath, timestamp) {
+  if (type === "codex") {
+    const dir = path.join(os.homedir(), ".codex", "sessions", "mock");
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `mock-${process.pid}.jsonl`);
+    fs.writeFileSync(filePath, `${JSON.stringify({
+      type: "session_meta",
+      payload: {
+        cwd: currentPath,
+        timestamp,
+      },
+    })}\n`);
+    return filePath;
+  }
+
+  if (type === "claude") {
+    const dir = path.join(os.homedir(), ".claude", "projects", createHash("sha1").update(currentPath).digest("hex"));
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `mock-${process.pid}.jsonl`);
+    fs.writeFileSync(filePath, `${JSON.stringify({
+      cwd: currentPath,
+      timestamp,
+      type: "bootstrap",
+    })}\n`);
+    return filePath;
+  }
+
+  const dir = path.join(os.homedir(), ".gemini", "tmp");
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, `mock-${process.pid}.json`);
+  fs.writeFileSync(filePath, JSON.stringify({
+    startTime: timestamp,
+    lastUpdated: timestamp,
+    projectHash: createHash("sha256").update(currentPath).digest("hex"),
+    messages: [],
+  }, null, 2));
+  return filePath;
+}
+
+function appendAnswer(type, filePath, reply) {
+  const timestamp = new Date().toISOString();
+
+  if (type === "codex") {
+    fs.appendFileSync(filePath, `${JSON.stringify({
+      type: "response_item",
+      timestamp,
+      payload: {
+        id: `codex-${turn}`,
+        type: "message",
+        role: "assistant",
+        phase: "final_answer",
+        content: [
+          { type: "output_text", text: reply },
+        ],
+      },
+    })}\n`);
+    return;
+  }
+
+  if (type === "claude") {
+    fs.appendFileSync(filePath, `${JSON.stringify({
+      type: "assistant",
+      uuid: `claude-${turn}`,
+      timestamp,
+      message: {
+        role: "assistant",
+        stop_reason: "end_turn",
+        content: [
+          { type: "text", text: reply },
+        ],
+      },
+    })}\n`);
+    return;
+  }
+
+  const current = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  current.lastUpdated = timestamp;
+  current.messages = Array.isArray(current.messages) ? current.messages : [];
+  current.messages.push({
+    id: `gemini-${turn}`,
+    type: "gemini",
+    content: reply,
+    toolCalls: [],
+    timestamp,
+  });
+  fs.writeFileSync(filePath, JSON.stringify(current, null, 2));
+}

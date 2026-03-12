@@ -1,7 +1,7 @@
 {
   "name": "muuuuse",
-  "version": "1.4.0",
-  "description": "🔌Muuuuse arms two raw terminals and bounces BEL-marked final output between them.",
+  "version": "1.4.1",
+  "description": "🔌Muuuuse arms two regular terminals and relays final answers between them.",
   "type": "commonjs",
   "bin": {
     "muuuuse": "bin/muuse.js"
