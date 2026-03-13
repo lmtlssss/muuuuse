@@ -1,4 +1,4 @@
-const { BRAND, usage } = require("./util");
+const { BRAND, normalizeSeatId, usage } = require("./util");
 const { ArmedSeat, getStatusReport, stopAllSessions } = require("./runtime");
 
 async function main(argv = process.argv.slice(2)) {
@@ -54,12 +54,13 @@ async function main(argv = process.argv.slice(2)) {
     return;
   }
 
-  if (command === "1" || command === "2") {
+  const seatId = normalizeSeatId(command);
+  if (seatId) {
     const flowMode = parseSeatFlowMode(command, argv.slice(1));
     const seat = new ArmedSeat({
       cwd: process.cwd(),
       flowMode,
-      seatId: Number(command),
+      seatId,
     });
     const code = await seat.run();
     process.exit(code);

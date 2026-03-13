@@ -60,6 +60,7 @@ async function main() {
   await testPassiveTerminalReportsDoNotClearRelayContext();
   await testBareEscapeDoesNotClearRelayContext();
   await testSeatSpecificFlowModes();
+  await testAdditionalPairsStaySeparate();
   await testStopSilencesBellLoop();
   process.stdout.write("muuuuse tests passed\n");
 }
@@ -72,6 +73,8 @@ function testUsage() {
 
   assert.match(output, /muuuuse 1/);
   assert.match(output, /muuuuse 2/);
+  assert.match(output, /muuuuse 3/);
+  assert.match(output, /muuuuse 4/);
   assert.match(output, /muuuuse status/);
   assert.match(output, /muuuuse stop/);
 }
@@ -1028,6 +1031,77 @@ async function testSeatSpecificFlowModes() {
   }
 }
 
+async function testAdditionalPairsStaySeparate() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-pairs-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-pairs-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home });
+  const seat2 = spawnSeat(2, { cwd, home });
+  const seat3 = spawnSeat(3, { cwd, home });
+  const seat4 = spawnSeat(4, { cwd, home });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    await seat3.waitFor(/seat 3 armed/i);
+    await seat4.waitFor(/seat 4 armed/i);
+
+    seat1.write(`MOCK_REPLY_TEXT=ONE MOCK_REPLY_DELAY_MS=120 ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`MOCK_REPLY_TEXT=TWO MOCK_REPLY_DELAY_MS=120 ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+    seat3.write(`MOCK_REPLY_TEXT=THREE MOCK_REPLY_DELAY_MS=120 ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat4.write(`MOCK_REPLY_TEXT=FOUR MOCK_REPLY_DELAY_MS=120 ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+    await seat3.waitFor(/codex-ready/);
+    await seat4.waitFor(/gemini-ready/);
+
+    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 3: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 4: running .*trust paired/i);
+
+    seat1.write("ignite-one\r");
+    seat3.write("ignite-three\r");
+
+    await seat1.waitFor(/\bONE\b/);
+    await seat2.waitFor(/\bONE\b/);
+    await seat1.waitFor(/\bTWO\b/);
+    await seat2.waitFor(/\bTWO\b/);
+    await seat3.waitFor(/\bTHREE\b/);
+    await seat4.waitFor(/\bTHREE\b/);
+    await seat3.waitFor(/\bFOUR\b/);
+    await seat4.waitFor(/\bFOUR\b/);
+    await sleep(1600);
+
+    const sessionNames = await waitForSessionNames(home, 2);
+    const pair12 = sessionNames.find((sessionName) => readAnswerEvents(home, sessionName, 1).length > 0);
+    const pair34 = sessionNames.find((sessionName) => readAnswerEvents(home, sessionName, 3).length > 0);
+
+    assert(pair12, "expected a distinct session for seats 1/2");
+    assert(pair34, "expected a distinct session for seats 3/4");
+    assert.notEqual(pair12, pair34);
+
+    const pair12Seat1 = readAnswerEvents(home, pair12, 1);
+    const pair12Seat2 = readAnswerEvents(home, pair12, 2);
+    const pair34Seat3 = readAnswerEvents(home, pair34, 3);
+    const pair34Seat4 = readAnswerEvents(home, pair34, 4);
+
+    assert.equal(pair12Seat1[0].text, "ONE");
+    assert.equal(pair12Seat2[0].text, "TWO");
+    assert.equal(pair34Seat3[0].text, "THREE");
+    assert.equal(pair34Seat4[0].text, "FOUR");
+
+    assert.doesNotMatch(seat2.getBuffer(), /\bTHREE\b|\bFOUR\b/);
+    assert.doesNotMatch(seat4.getBuffer(), /\bONE\b|\bTWO\b/);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+    seat3.dispose();
+    seat4.dispose();
+  }
+}
+
 async function testStopSilencesBellLoop() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-bell-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-bell-cwd-"));
@@ -1272,6 +1346,30 @@ async function waitForSessionName(home, cwd, timeoutMs = 15000) {
     env: buildEnv(home),
   });
   throw new Error(`status timed out waiting for a session name.\n\n${finalOutput}`);
+}
+
+async function waitForSessionNames(home, count, timeoutMs = 15000) {
+  const sessionsRoot = path.join(home, ".muuuuse", "sessions");
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    let names = [];
+    try {
+      names = fs.readdirSync(sessionsRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+        .sort();
+    } catch {
+      names = [];
+    }
+
+    if (names.length >= count) {
+      return names;
+    }
+
+    await sleep(100);
+  }
+
+  throw new Error(`timed out waiting for ${count} muuuuse sessions under ${sessionsRoot}`);
 }
 
 async function waitForBuffer(getBuffer, pattern, timeoutMs, label) {

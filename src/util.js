@@ -167,6 +167,42 @@ function getSessionPaths(sessionName) {
   };
 }
 
+function normalizeSeatId(value) {
+  const seatId = Number.parseInt(String(value || "").trim(), 10);
+  if (!Number.isInteger(seatId) || seatId <= 0) {
+    return null;
+  }
+  return seatId;
+}
+
+function isAnchorSeat(seatId) {
+  return normalizeSeatId(seatId) % 2 === 1;
+}
+
+function getPartnerSeatId(seatId) {
+  const normalized = normalizeSeatId(seatId);
+  if (!normalized) {
+    return null;
+  }
+  return isAnchorSeat(normalized) ? normalized + 1 : normalized - 1;
+}
+
+function listSeatIds(sessionName) {
+  const sessionDir = getSessionDir(sessionName);
+  try {
+    return fs.readdirSync(sessionDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const match = entry.name.match(/^seat-(\d+)$/);
+        return match ? Number.parseInt(match[1], 10) : null;
+      })
+      .filter((seatId) => Number.isInteger(seatId))
+      .sort((left, right) => left - right);
+  } catch {
+    return [];
+  }
+}
+
 function getSeatDir(sessionName, seatId) {
   return ensureDir(path.join(getSessionDir(sessionName), `seat-${seatId}`));
 }
@@ -245,7 +281,7 @@ function listSessionNames() {
 
 function usage() {
   return [
-    `${BRAND} arms two regular terminals and relays assistant output between them.`,
+    `${BRAND} arms regular terminals in isolated odd/even pairs and relays assistant output between each pair.`,
     "",
     "Usage:",
     "  muuuuse 1",
@@ -254,17 +290,20 @@ function usage() {
     "  muuuuse 2",
     "  muuuuse 2 flow on",
     "  muuuuse 2 flow off",
+    "  muuuuse 3",
+    "  muuuuse 4",
     "  muuuuse stop",
     "  muuuuse status",
     "",
     "Flow:",
     "  1. Run `muuuuse 1` in terminal one.",
     "  2. Run `muuuuse 2` in terminal two.",
-    "  3. Seat 1 generates the session key and seat 2 signs it automatically.",
-    "  4. Optional: arm each seat with `flow on` or `flow off`.",
-    "  5. Use those armed shells normally.",
-    "  6. `flow off` sends final answers only. `flow on` keeps assistant commentary bouncing.",
-    "  7. Run `muuuuse status` or `muuuuse stop` from any shell.",
+    "  3. The odd seat generates the session key and the matching even seat signs it automatically.",
+    "  4. Additional pairs work the same way: `3/4`, `5/6`, `7/8`...",
+    "  5. Optional: arm each seat with `flow on` or `flow off`.",
+    "  6. Use those armed shells normally.",
+    "  7. `flow off` sends final answers only. `flow on` keeps assistant commentary bouncing.",
+    "  8. Run `muuuuse status` or `muuuuse stop` from any shell.",
     "",
     "Notes:",
     "  - No tmux.",
@@ -282,13 +321,17 @@ module.exports = {
   ensureDir,
   getDefaultSessionName,
   getFileSize,
+  getPartnerSeatId,
   loadOrCreateSeatIdentity,
+  isAnchorSeat,
   getSeatPaths,
   getSessionPaths,
   getStateRoot,
   hashText,
   isPidAlive,
+  listSeatIds,
   listSessionNames,
+  normalizeSeatId,
   readAppendedText,
   readJson,
   sanitizeRelayText,

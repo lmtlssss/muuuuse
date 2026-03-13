@@ -20,12 +20,16 @@ const {
   ensureDir,
   getDefaultSessionName,
   getFileSize,
+  getPartnerSeatId,
   getSeatPaths,
   getSessionPaths,
   hashText,
+  isAnchorSeat,
   isPidAlive,
+  listSeatIds,
   loadOrCreateSeatIdentity,
   listSessionNames,
+  normalizeSeatId,
   readAppendedText,
   readJson,
   sanitizeRelayText,
@@ -132,34 +136,40 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function findJoinableSessionName(currentPath = process.cwd()) {
+function findJoinableSessionName(currentPath = process.cwd(), seatId = 2) {
+  const normalizedSeatId = normalizeSeatId(seatId);
+  const anchorSeatId = getPartnerSeatId(normalizedSeatId);
+  if (!normalizedSeatId || !anchorSeatId || isAnchorSeat(normalizedSeatId)) {
+    return null;
+  }
+
   const candidates = listSessionNames()
     .map((sessionName) => {
       const sessionPaths = getSessionPaths(sessionName);
       const controller = readJson(sessionPaths.controllerPath, null);
-      const seat1Paths = getSeatPaths(sessionName, 1);
-      const seat2Paths = getSeatPaths(sessionName, 2);
-      const seat1Meta = readJson(seat1Paths.metaPath, null);
-      const seat1Status = readJson(seat1Paths.statusPath, null);
-      const seat2Meta = readJson(seat2Paths.metaPath, null);
-      const seat2Status = readJson(seat2Paths.statusPath, null);
+      const anchorPaths = getSeatPaths(sessionName, anchorSeatId);
+      const seatPaths = getSeatPaths(sessionName, normalizedSeatId);
+      const anchorMeta = readJson(anchorPaths.metaPath, null);
+      const anchorStatus = readJson(anchorPaths.statusPath, null);
+      const seatMeta = readJson(seatPaths.metaPath, null);
+      const seatStatus = readJson(seatPaths.statusPath, null);
       const stopRequest = readJson(sessionPaths.stopPath, null);
 
-      const cwd = controller?.cwd || seat1Status?.cwd || seat1Meta?.cwd || seat2Status?.cwd || seat2Meta?.cwd || null;
+      const cwd = controller?.cwd || anchorStatus?.cwd || anchorMeta?.cwd || seatStatus?.cwd || seatMeta?.cwd || null;
       if (!matchesWorkingPath(cwd, currentPath)) {
         return null;
       }
 
-      const seat1WrapperPid = seat1Status?.pid || seat1Meta?.pid || null;
-      const seat1ChildPid = seat1Status?.childPid || seat1Meta?.childPid || null;
-      const seat2WrapperPid = seat2Status?.pid || seat2Meta?.pid || null;
-      const seat2ChildPid = seat2Status?.childPid || seat2Meta?.childPid || null;
-      const seat1Live = isPidAlive(seat1WrapperPid) || isPidAlive(seat1ChildPid);
-      const seat2Live = isPidAlive(seat2WrapperPid) || isPidAlive(seat2ChildPid);
+      const anchorWrapperPid = anchorStatus?.pid || anchorMeta?.pid || null;
+      const anchorChildPid = anchorStatus?.childPid || anchorMeta?.childPid || null;
+      const seatWrapperPid = seatStatus?.pid || seatMeta?.pid || null;
+      const seatChildPid = seatStatus?.childPid || seatMeta?.childPid || null;
+      const anchorLive = isPidAlive(anchorWrapperPid) || isPidAlive(anchorChildPid);
+      const seatLive = isPidAlive(seatWrapperPid) || isPidAlive(seatChildPid);
       const stopRequestedAtMs = Date.parse(stopRequest?.requestedAt || "");
-      const createdAtMs = Date.parse(controller?.createdAt || seat1Meta?.startedAt || seat1Status?.updatedAt || "");
+      const createdAtMs = Date.parse(controller?.createdAt || anchorMeta?.startedAt || anchorStatus?.updatedAt || "");
 
-      if (!seat1Live || seat2Live) {
+      if (!anchorLive || seatLive) {
         return null;
       }
 
@@ -178,10 +188,10 @@ function findJoinableSessionName(currentPath = process.cwd()) {
   return candidates[0]?.sessionName || null;
 }
 
-function waitForJoinableSessionName(currentPath = process.cwd(), timeoutMs = SEAT_JOIN_WAIT_MS) {
+function waitForJoinableSessionName(currentPath = process.cwd(), seatId = 2, timeoutMs = SEAT_JOIN_WAIT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
-    const sessionName = findJoinableSessionName(currentPath);
+    const sessionName = findJoinableSessionName(currentPath, seatId);
     if (sessionName) {
       return sessionName;
     }
@@ -192,15 +202,11 @@ function waitForJoinableSessionName(currentPath = process.cwd(), timeoutMs = SEA
 }
 
 function resolveSessionName(currentPath = process.cwd(), seatId = 1) {
-  if (seatId === 1) {
+  if (isAnchorSeat(seatId)) {
     return createSessionName(currentPath);
   }
 
-  if (seatId === 2) {
-    return waitForJoinableSessionName(currentPath);
-  }
-
-  return createSessionName(currentPath);
+  return waitForJoinableSessionName(currentPath, seatId);
 }
 
 function parseAnswerEntries(text) {
@@ -511,12 +517,15 @@ async function sendTextAndEnter(child, text, shouldAbort = () => false) {
 class ArmedSeat {
   constructor(options) {
     this.seatId = options.seatId;
-    this.partnerSeatId = options.seatId === 1 ? 2 : 1;
+    this.partnerSeatId = getPartnerSeatId(options.seatId);
+    this.anchorSeatId = isAnchorSeat(options.seatId) ? options.seatId : this.partnerSeatId;
     this.flowMode = normalizeFlowMode(options.flowMode);
     this.cwd = normalizeWorkingPath(options.cwd);
     this.sessionName = resolveSessionName(this.cwd, this.seatId);
     if (!this.sessionName) {
-      throw new Error("No armed `muuuuse 1` seat is waiting in this cwd. Run `muuuuse 1` first.");
+      throw new Error(
+        `No armed \`muuuuse ${this.partnerSeatId}\` seat is waiting in this cwd. Run \`muuuuse ${this.partnerSeatId}\` first.`
+      );
     }
     this.sessionPaths = getSessionPaths(this.sessionName);
     this.paths = getSeatPaths(this.sessionName, this.seatId);
@@ -542,7 +551,7 @@ class ArmedSeat {
     this.trustState = {
       challenge: null,
       peerPublicKey: null,
-      phase: this.seatId === 1 ? "waiting_for_peer_signature" : "waiting_for_seat1_key",
+      phase: isAnchorSeat(this.seatId) ? "waiting_for_peer_signature" : "waiting_for_anchor_key",
       pairedAt: null,
     };
     this.liveState = {
@@ -565,9 +574,11 @@ class ArmedSeat {
       cwd: this.cwd,
       createdAt: current.createdAt || this.startedAt,
       updatedAt: new Date().toISOString(),
-      seat1Pid: this.seatId === 1 ? process.pid : current.seat1Pid || null,
-      seat2Pid: this.seatId === 2 ? process.pid : current.seat2Pid || null,
-      pid: this.seatId === 1 ? process.pid : current.pid || null,
+      anchorSeatId: this.anchorSeatId,
+      partnerSeatId: this.partnerSeatId,
+      anchorSeatPid: this.seatId === this.anchorSeatId ? process.pid : current.anchorSeatPid || null,
+      partnerSeatPid: this.seatId === this.partnerSeatId ? process.pid : current.partnerSeatPid || null,
+      pid: this.seatId === this.anchorSeatId ? process.pid : current.pid || null,
       ...extra,
     });
   }
@@ -609,7 +620,7 @@ class ArmedSeat {
   initializeTrustMaterial() {
     this.identity = loadOrCreateSeatIdentity(this.paths);
 
-    if (this.seatId !== 1) {
+    if (!isAnchorSeat(this.seatId)) {
       return;
     }
 
@@ -632,7 +643,7 @@ class ArmedSeat {
       this.initializeTrustMaterial();
     }
 
-    if (this.seatId === 1) {
+    if (isAnchorSeat(this.seatId)) {
       this.syncSeatOneTrust();
       return;
     }
@@ -713,7 +724,7 @@ class ArmedSeat {
       this.trustState = {
         challenge: null,
         peerPublicKey: null,
-        phase: "waiting_for_seat1_key",
+        phase: "waiting_for_anchor_key",
         pairedAt: null,
       };
       return;
@@ -1319,10 +1330,10 @@ class ArmedSeat {
     this.log(`${BRAND} seat ${this.seatId} armed for ${this.sessionName}.`);
     this.log("Use this shell normally. Codex, Claude, and Gemini relay automatically from their local session logs.");
     this.log(`Seat ${this.seatId} relay mode is flow ${this.flowMode}.`);
-    if (this.seatId === 1) {
-      this.log("Seat 1 generated the session key and is waiting for seat 2 to sign it.");
+    if (isAnchorSeat(this.seatId)) {
+      this.log(`Seat ${this.seatId} generated the session key and is waiting for seat ${this.partnerSeatId} to sign it.`);
     } else {
-      this.log("Seat 2 will sign the session key from seat 1, then relay goes live.");
+      this.log(`Seat ${this.seatId} will sign the session key from seat ${this.partnerSeatId}, then relay goes live.`);
     }
     this.log("Run `muuuuse status` or `muuuuse stop` from any terminal.");
 
@@ -1443,7 +1454,7 @@ function getStatusReport() {
       const sessionPaths = getSessionPaths(sessionName);
       const controller = readJson(sessionPaths.controllerPath, null);
       const stopRequest = readJson(sessionPaths.stopPath, null);
-      const seats = [1, 2]
+      const seats = listSeatIds(sessionName)
         .map((seatId) => buildSeatReport(sessionName, seatId))
         .filter((entry) => entry !== null);
 

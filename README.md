@@ -6,6 +6,7 @@ It does one job:
 - arm terminal one with `muuuuse 1`
 - arm terminal two with `muuuuse 2`
 - have seat 1 generate a session key and seat 2 sign it
+- additional isolated pairs work the same way: `3/4`, `5/6`, `7/8`, ...
 - choose per-seat relay mode with `flow on` or `flow off`
 - watch Codex, Claude, or Gemini for local assistant output
 - inject that output into the other armed terminal
@@ -18,6 +19,8 @@ muuuuse 1
 muuuuse 1 flow on
 muuuuse 2
 muuuuse 2 flow off
+muuuuse 3
+muuuuse 4
 muuuuse status
 muuuuse stop
 ```
@@ -36,7 +39,7 @@ Terminal 2:
 muuuuse 2 flow off
 ```
 
-Now both shells are armed. `muuuuse 1` generates the session key, `muuuuse 2` signs it, and only that signed pair relays. Use those shells normally.
+Now both shells are armed. `muuuuse 1` generates the session key, `muuuuse 2` signs it, and only that signed pair relays. Every odd/even adjacent pair works the same way in parallel: `3/4`, `5/6`, `7/8`, and so on. Use those shells normally.
 
 `flow on` means that seat sends commentary and final answers. `flow off` means that seat waits for final answers only. Each seat decides what it sends out, so mixed calibration is allowed.
 
