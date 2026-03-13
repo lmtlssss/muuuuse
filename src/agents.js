@@ -481,6 +481,7 @@ function parseCodexAssistantLine(line, options = {}) {
     return {
       id: entry.payload.id || hashText(line),
       text,
+      phase: phase === "commentary" ? "commentary" : "final_answer",
       timestamp: entry.timestamp || entry.payload.timestamp || new Date().toISOString(),
     };
   } catch {
@@ -597,6 +598,7 @@ function parseClaudeAssistantLine(line, options = {}) {
     return {
       id: entry.uuid || entry.message.id || hashText(line),
       text,
+      phase: flowMode && entry.message?.stop_reason !== "end_turn" ? "commentary" : "final_answer",
       timestamp: entry.timestamp || new Date().toISOString(),
     };
   } catch {
@@ -672,6 +674,7 @@ function readGeminiAnswers(filePath, lastMessageId = null, sinceMs = null) {
     const answers = finalMessages.slice(startIndex).map((message) => ({
       id: message.id || hashText(JSON.stringify(message)),
       text: sanitizeRelayText(message.content),
+      phase: "final_answer",
       timestamp: message.timestamp || entry.lastUpdated || new Date().toISOString(),
     }));
 

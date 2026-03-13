@@ -444,6 +444,7 @@ function buildAnswerSignaturePayload(sessionName, challenge, entry) {
     id: entry.id,
     seatId: entry.seatId,
     origin: entry.origin,
+    phase: entry.phase || "final_answer",
     createdAt: entry.createdAt,
     text: entry.text,
   });
@@ -457,6 +458,7 @@ function buildContinuationEntry(sourceSessionName, targetSeatId, entry) {
     sourceSeatId: entry.seatId,
     targetSeatId,
     origin: entry.origin || "unknown",
+    phase: entry.phase || "final_answer",
     text: entry.text,
     createdAt: entry.createdAt || new Date().toISOString(),
     chainId: entry.chainId,
@@ -465,6 +467,15 @@ function buildContinuationEntry(sourceSessionName, targetSeatId, entry) {
     publicKey: entry.publicKey || null,
     signature: entry.signature || null,
   };
+}
+
+function getRelayPhase(entry) {
+  const phase = String(entry?.phase || "").trim().toLowerCase();
+  return phase === "commentary" ? "commentary" : "final_answer";
+}
+
+function shouldAcceptInboundEntry(flowMode, entry) {
+  return flowMode === "on" || getRelayPhase(entry) === "final_answer";
 }
 
 function getSeatDirIfExists(sessionName, seatId) {
@@ -1067,6 +1078,10 @@ class ArmedSeat {
         return;
       }
 
+      if (!shouldAcceptInboundEntry(this.flowMode, entry)) {
+        continue;
+      }
+
       const payload = sanitizeRelayText(entry.text);
       const signaturePayload = buildAnswerSignaturePayload(this.sessionName, this.trustState.challenge, {
         chainId: entry.chainId || entry.id,
@@ -1074,6 +1089,7 @@ class ArmedSeat {
         id: entry.id,
         seatId: entry.seatId,
         origin: entry.origin || "unknown",
+        phase: getRelayPhase(entry),
         createdAt: entry.createdAt,
         text: payload,
       });
@@ -1127,6 +1143,10 @@ class ArmedSeat {
       if (this.stopped || this.stopRequested()) {
         this.requestStop("stop_requested");
         return;
+      }
+
+      if (!shouldAcceptInboundEntry(this.flowMode, entry)) {
+        continue;
       }
 
       const payload = sanitizeRelayText(entry.text);
@@ -1371,6 +1391,7 @@ class ArmedSeat {
       this.emitAnswer({
         id: answer.id || createId(12),
         origin: detectedAgent.type,
+        phase: answer.phase || "final_answer",
         text: answer.text,
         createdAt: answer.timestamp || new Date().toISOString(),
       });
@@ -1416,6 +1437,7 @@ class ArmedSeat {
       type: "answer",
       seatId: this.seatId,
       origin: entry.origin || "unknown",
+      phase: entry.phase || "final_answer",
       text: payload,
       createdAt: entry.createdAt || new Date().toISOString(),
       chainId: pendingInboundContext?.chainId || entry.chainId || entryId,

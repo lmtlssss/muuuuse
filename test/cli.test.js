@@ -62,6 +62,7 @@ async function main() {
   await testSeatSpecificFlowModes();
   await testAdditionalPairsStaySeparate();
   await testContinuationTargetsChainAcrossPairs();
+  await testFlowOffContinuationSuppressesCommentary();
   await testStopSilencesBellLoop();
   process.stdout.write("muuuuse tests passed\n");
 }
@@ -111,6 +112,7 @@ function testCodexParsing() {
   assert.deepEqual(parsed, {
     id: "codex-turn-1",
     text: "First final answer.\nSecond line.",
+    phase: "final_answer",
     timestamp: "2026-03-09T12:00:00.000Z",
   });
 
@@ -184,6 +186,7 @@ function testClaudeParsing() {
   assert.deepEqual(parsed, {
     id: "claude-turn-1",
     text: "Claude final answer.",
+    phase: "final_answer",
     timestamp: "2026-03-09T12:00:00.000Z",
   });
 }
@@ -1017,16 +1020,15 @@ async function testSeatSpecificFlowModes() {
 
     seat1.write("Reply with exactly FLOW_ON and nothing else.\r");
 
-    await seat2.waitFor(/Thinking about:/);
-    await seat2.waitFor(/Still reasoning on turn 1\./);
     await seat2.waitFor(/FLOW_ON/);
     await sleep(1200);
 
     const seat1Events = readAnswerEvents(home, sessionName, 1);
+    const seat2Buffer = seat2.getBuffer();
 
-    assert(seat1Events.some((entry) => entry.text.includes("Thinking about:")));
-    assert(seat1Events.some((entry) => entry.text.includes("Still reasoning on turn 1.")));
     assert(seat1Events.some((entry) => entry.text.includes("FLOW_ON")));
+    assert.doesNotMatch(seat2Buffer, /Thinking about:/);
+    assert.doesNotMatch(seat2Buffer, /Still reasoning on turn 1\./);
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();
@@ -1186,6 +1188,58 @@ async function testContinuationTargetsChainAcrossPairs() {
     assert.equal(seat2Events[0].text, "TWO");
     assert.equal(seat3Events[0].text, "THREE");
     assert.equal(seat4Events[0].text, "FOUR");
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+    seat3.dispose();
+    seat4.dispose();
+  }
+}
+
+async function testFlowOffContinuationSuppressesCommentary() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-phase-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-phase-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["flow", "off"] });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "on", "continue", "3"] });
+  const seat3 = spawnSeat(3, { cwd, home, extraArgs: ["flow", "on"] });
+  const seat4 = spawnSeat(4, { cwd, home, extraArgs: ["flow", "off", "continue", "1"] });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    await seat3.waitFor(/seat 3 armed/i);
+    await seat4.waitFor(/seat 4 armed/i);
+
+    seat1.write(`MOCK_REPLY_TEXT=ONE MOCK_REPLY_DELAY_MS=80 ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`MOCK_REPLY_TEXT=TWO MOCK_REPLY_DELAY_MS=80 ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+    seat3.write(`${shellQuote(noisyCodexPath)}\r`);
+    seat4.write(`MOCK_REPLY_TEXT=FOUR MOCK_REPLY_DELAY_MS=80 ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+    await seat3.waitFor(/codex-ready/);
+    await seat4.waitFor(/gemini-ready/);
+
+    await waitForStatus(home, cwd, /seat 4: running .*flow off/i);
+    await waitForStatus(home, cwd, /seat 4: running .*trust paired/i);
+
+    seat1.write("ignite\r");
+
+    await seat3.waitFor(/Thinking about:/);
+    await seat3.waitFor(/Still reasoning on turn 1\./);
+    await seat4.waitFor(/FINAL-1/);
+    await seat4.waitFor(/FOUR/);
+    await waitForCondition(() => {
+      const sessions = listSessionDirs(home);
+      return sessions.some((sessionName) => readContinueEvents(home, sessionName, 1).some((entry) => entry.sourceSeatId === 4 && entry.text === "FOUR"));
+    }, 15000, "4 => 1 final continuation only");
+    await sleep(1200);
+
+    const seat1Buffer = seat1.getBuffer();
+    assert.match(seat1Buffer, /FOUR/);
+    assert.doesNotMatch(seat1Buffer, /Thinking about:/);
+    assert.doesNotMatch(seat1Buffer, /Still reasoning on turn 1\./);
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();

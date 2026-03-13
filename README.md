@@ -46,7 +46,7 @@ muuuuse 2 flow off
 
 Now both shells are armed. `muuuuse 1` generates the session key, `muuuuse 2` signs it, and only that signed pair relays. Every odd/even adjacent pair works the same way in parallel: `3/4`, `5/6`, `7/8`, and so on. Use those shells normally.
 
-`flow on` means that seat sends commentary and final answers. `flow off` means that seat waits for final answers only. Each seat decides what it sends out, so mixed calibration is allowed.
+`flow on` means that seat relays commentary and final answers. `flow off` means that seat relays and accepts final answers only. Mixed calibration is allowed per seat.
 
 `continue <seat>` forwards that seat's relayed output into another armed seat without changing the signed odd/even pair law. This lets you build local loops like `1 -> 2 -> 3 -> 4 -> 1` while every adjacent pair still keeps its own session keypair.
 
