@@ -61,6 +61,7 @@ async function main() {
   await testBareEscapeDoesNotClearRelayContext();
   await testSeatSpecificFlowModes();
   await testAdditionalPairsStaySeparate();
+  await testContinuationTargetsChainAcrossPairs();
   await testStopSilencesBellLoop();
   process.stdout.write("muuuuse tests passed\n");
 }
@@ -75,6 +76,8 @@ function testUsage() {
   assert.match(output, /muuuuse 2/);
   assert.match(output, /muuuuse 3/);
   assert.match(output, /muuuuse 4/);
+  assert.match(output, /continue 3/);
+  assert.match(output, /continue 1/);
   assert.match(output, /muuuuse status/);
   assert.match(output, /muuuuse stop/);
 }
@@ -86,7 +89,7 @@ function testRejectsExtraArgs() {
       stdio: "pipe",
       env: process.env,
     });
-  }, /accepts either no extra arguments or `flow on` \/ `flow off`/i);
+  }, /accepts no extra arguments, `flow on` \/ `flow off`, optional `continue <seat>`, or both in sequence/i);
 }
 
 function testCodexParsing() {
@@ -1102,6 +1105,96 @@ async function testAdditionalPairsStaySeparate() {
   }
 }
 
+async function testContinuationTargetsChainAcrossPairs() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["flow", "off"] });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "on", "continue", "3"] });
+  const seat3 = spawnSeat(3, { cwd, home, extraArgs: ["flow", "on"] });
+  const seat4 = spawnSeat(4, { cwd, home, extraArgs: ["flow", "off", "continue", "1"] });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    await seat3.waitFor(/seat 3 armed/i);
+    await seat4.waitFor(/seat 4 armed/i);
+
+    seat1.write(`MOCK_REPLY_TEXT=ONE MOCK_REPLY_DELAY_MS=80 ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`MOCK_REPLY_TEXT=TWO MOCK_REPLY_DELAY_MS=80 ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+    seat3.write(`MOCK_REPLY_TEXT=THREE MOCK_REPLY_DELAY_MS=80 ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat4.write(`MOCK_REPLY_TEXT=FOUR MOCK_REPLY_DELAY_MS=80 ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+    await seat3.waitFor(/codex-ready/);
+    await seat4.waitFor(/gemini-ready/);
+
+    await waitForStatus(home, cwd, /seat 1: running .*flow off/i);
+    await waitForStatus(home, cwd, /seat 2: running .*flow on/i);
+    await waitForStatus(home, cwd, /seat 3: running .*flow on/i);
+    await waitForStatus(home, cwd, /seat 4: running .*flow off/i);
+    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 3: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 4: running .*trust paired/i);
+
+    const liveStatus = execFileSync(process.execPath, [binPath, "status"], {
+      encoding: "utf8",
+      cwd,
+      env: buildEnv(home),
+    });
+    assert.match(liveStatus, /seat 2: running .*continue 3/i);
+    assert.match(liveStatus, /seat 4: running .*continue 1/i);
+
+    seat1.write("ignite\r");
+
+    await waitForCondition(() => {
+      const sessions = listSessionDirs(home);
+      return sessions.some((sessionName) => readContinueEvents(home, sessionName, 3).some((entry) => entry.sourceSeatId === 2 && entry.text === "TWO"));
+    }, 15000, "2 => 3 continuation");
+    await waitForCondition(() => {
+      const sessions = listSessionDirs(home);
+      return sessions.some((sessionName) => readContinueEvents(home, sessionName, 1).some((entry) => entry.sourceSeatId === 4 && entry.text === "FOUR"));
+    }, 15000, "4 => 1 continuation");
+    await waitForCondition(() => {
+      const sessions = listSessionDirs(home);
+      return sessions.some((sessionName) => readAnswerEvents(home, sessionName, 3).some((entry) => entry.text === "THREE"));
+    }, 15000, "seat 3 answer");
+    await waitForCondition(() => {
+      const sessions = listSessionDirs(home);
+      return sessions.some((sessionName) => readAnswerEvents(home, sessionName, 4).some((entry) => entry.text === "FOUR"));
+    }, 15000, "seat 4 answer");
+    await waitForCondition(() => {
+      const sessions = listSessionDirs(home);
+      return sessions.some((sessionName) => readAnswerEvents(home, sessionName, 1).filter((entry) => entry.text === "ONE").length >= 2);
+    }, 15000, "looped seat 1 answer");
+
+    const sessionNames = await waitForSessionNames(home, 2);
+    const pair12 = sessionNames.find((sessionName) => readAnswerEvents(home, sessionName, 1).length > 0);
+    const pair34 = sessionNames.find((sessionName) => readAnswerEvents(home, sessionName, 3).length > 0);
+
+    assert(pair12, "expected a distinct session for seats 1/2");
+    assert(pair34, "expected a distinct session for seats 3/4");
+    assert.notEqual(pair12, pair34);
+
+    const seat1Events = readAnswerEvents(home, pair12, 1);
+    const seat2Events = readAnswerEvents(home, pair12, 2);
+    const seat3Events = readAnswerEvents(home, pair34, 3);
+    const seat4Events = readAnswerEvents(home, pair34, 4);
+
+    assert(seat1Events.filter((entry) => entry.text === "ONE").length >= 2);
+    assert.equal(seat2Events[0].text, "TWO");
+    assert.equal(seat3Events[0].text, "THREE");
+    assert.equal(seat4Events[0].text, "FOUR");
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+    seat3.dispose();
+    seat4.dispose();
+  }
+}
+
 async function testStopSilencesBellLoop() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-bell-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-bell-cwd-"));
@@ -1287,6 +1380,32 @@ function readAnswerEvents(home, sessionName, seatId) {
   }
 }
 
+function readContinueEvents(home, sessionName, seatId) {
+  const eventsPath = path.join(home, ".muuuuse", "sessions", sessionName, `seat-${seatId}`, "continue.jsonl");
+  try {
+    return fs.readFileSync(eventsPath, "utf8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry && entry.type === "continue");
+  } catch {
+    return [];
+  }
+}
+
+function listSessionDirs(home) {
+  const sessionsRoot = path.join(home, ".muuuuse", "sessions");
+  try {
+    return fs.readdirSync(sessionsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
 async function forceStop(home, cwd) {
   try {
     execFileSync(process.execPath, [binPath, "stop"], {
@@ -1349,18 +1468,9 @@ async function waitForSessionName(home, cwd, timeoutMs = 15000) {
 }
 
 async function waitForSessionNames(home, count, timeoutMs = 15000) {
-  const sessionsRoot = path.join(home, ".muuuuse", "sessions");
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    let names = [];
-    try {
-      names = fs.readdirSync(sessionsRoot, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => entry.name)
-        .sort();
-    } catch {
-      names = [];
-    }
+    const names = listSessionDirs(home);
 
     if (names.length >= count) {
       return names;
@@ -1369,7 +1479,20 @@ async function waitForSessionNames(home, count, timeoutMs = 15000) {
     await sleep(100);
   }
 
+  const sessionsRoot = path.join(home, ".muuuuse", "sessions");
   throw new Error(`timed out waiting for ${count} muuuuse sessions under ${sessionsRoot}`);
+}
+
+async function waitForCondition(predicate, timeoutMs, label) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) {
+      return;
+    }
+    await sleep(50);
+  }
+
+  throw new Error(`${label} timed out after ${timeoutMs}ms.`);
 }
 
 async function waitForBuffer(getBuffer, pattern, timeoutMs, label) {

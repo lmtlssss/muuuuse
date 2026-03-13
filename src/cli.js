@@ -56,9 +56,10 @@ async function main(argv = process.argv.slice(2)) {
 
   const seatId = normalizeSeatId(command);
   if (seatId) {
-    const flowMode = parseSeatFlowMode(command, argv.slice(1));
+    const { flowMode, continueSeatId } = parseSeatOptions(command, argv.slice(1));
     const seat = new ArmedSeat({
       cwd: process.cwd(),
+      continueSeatId,
       flowMode,
       seatId,
     });
@@ -82,6 +83,9 @@ function renderSeatStatus(seat) {
   if (seat.partnerLive) {
     bits.push("peer live");
   }
+  if (seat.continueSeatId) {
+    bits.push(`continue ${seat.continueSeatId}`);
+  }
   if (seat.trust) {
     bits.push(`trust ${seat.trust}`);
   }
@@ -99,21 +103,55 @@ function renderSeatStatus(seat) {
   return output;
 }
 
-function parseSeatFlowMode(command, args) {
-  if (args.length === 0) {
-    return "off";
+function parseSeatOptions(command, args) {
+  let flowMode = "off";
+  let continueSeatId = null;
+
+  for (let index = 0; index < args.length;) {
+    const token = String(args[index] || "").trim().toLowerCase();
+
+    if (token === "flow") {
+      const flowToken = String(args[index + 1] || "").trim().toLowerCase();
+      if (flowToken === "on" || flowToken === "off") {
+        flowMode = flowToken;
+        index += 2;
+        continue;
+      }
+      break;
+    }
+
+    if (token === "continue") {
+      const targetSeatId = normalizeSeatId(args[index + 1]);
+      if (targetSeatId) {
+        continueSeatId = targetSeatId;
+        index += 2;
+        continue;
+      }
+      break;
+    }
+
+    break;
   }
 
-  if (args.length === 2 && String(args[0]).trim().toLowerCase() === "flow") {
-    const flowMode = String(args[1]).trim().toLowerCase();
-    if (flowMode === "on" || flowMode === "off") {
-      return flowMode;
-    }
+  if (args.length === 0 || (flowMode || continueSeatId !== null) && consumedAllArgs(args, flowMode, continueSeatId)) {
+    return { flowMode, continueSeatId };
   }
 
   throw new Error(
-    `\`muuuuse ${command}\` accepts either no extra arguments or \`flow on\` / \`flow off\`. Run it directly in the terminal you want to arm.`
+    `\`muuuuse ${command}\` accepts no extra arguments, \`flow on\` / \`flow off\`, optional \`continue <seat>\`, or both in sequence. Run it directly in the terminal you want to arm.`
   );
+}
+
+function consumedAllArgs(args, flowMode, continueSeatId) {
+  const expected = [];
+  if (flowMode !== "off" || args.includes("flow")) {
+    expected.push("flow", flowMode);
+  }
+  if (continueSeatId !== null || args.includes("continue")) {
+    expected.push("continue", String(continueSeatId));
+  }
+  return expected.length === args.length &&
+    expected.every((value, index) => String(args[index]).trim().toLowerCase() === String(value).trim().toLowerCase());
 }
 
 module.exports = {

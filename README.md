@@ -17,10 +17,15 @@ The whole surface is:
 ```bash
 muuuuse 1
 muuuuse 1 flow on
+muuuuse 1 flow off
+muuuuse 1 flow off continue 5
 muuuuse 2
 muuuuse 2 flow off
+muuuuse 2 flow on continue 3
 muuuuse 3
+muuuuse 3 flow on
 muuuuse 4
+muuuuse 4 flow off continue 1
 muuuuse status
 muuuuse stop
 ```
@@ -42,6 +47,8 @@ muuuuse 2 flow off
 Now both shells are armed. `muuuuse 1` generates the session key, `muuuuse 2` signs it, and only that signed pair relays. Every odd/even adjacent pair works the same way in parallel: `3/4`, `5/6`, `7/8`, and so on. Use those shells normally.
 
 `flow on` means that seat sends commentary and final answers. `flow off` means that seat waits for final answers only. Each seat decides what it sends out, so mixed calibration is allowed.
+
+`continue <seat>` forwards that seat's relayed output into another armed seat without changing the signed odd/even pair law. This lets you build local loops like `1 -> 2 -> 3 -> 4 -> 1` while every adjacent pair still keeps its own session keypair.
 
 If you want Codex in one and Gemini in the other, start them inside the armed shells:
 
@@ -72,6 +79,7 @@ muuuuse stop
 - no tmux
 - state lives under `~/.muuuuse`
 - only the signed armed pair can exchange relay events
+- `continue <seat>` is a separate local forwarding lane and can target any armed seat number
 - supported relay detection is built for Codex, Claude, and Gemini
 - `codeman` remains the larger transport/control layer; `muuuuse` stays local and minimal
 

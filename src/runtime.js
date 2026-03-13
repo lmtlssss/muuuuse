@@ -23,6 +23,7 @@ const {
   getPartnerSeatId,
   getSeatPaths,
   getSessionPaths,
+  getStateRoot,
   hashText,
   isAnchorSeat,
   isPidAlive,
@@ -57,6 +58,11 @@ const CHILD_ENV_DROP_KEYS = [
 
 function normalizeFlowMode(flowMode) {
   return String(flowMode || "").trim().toLowerCase() === "on" ? "on" : "off";
+}
+
+function normalizeContinueSeatId(value) {
+  const seatId = normalizeSeatId(value);
+  return seatId || null;
 }
 
 function resolveShell() {
@@ -222,6 +228,26 @@ function parseAnswerEntries(text) {
       }
     })
     .filter((entry) => entry && entry.type === "answer" && typeof entry.text === "string");
+}
+
+function parseContinueEntries(text, targetSeatId) {
+  return String(text || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry) => (
+      entry &&
+      entry.type === "continue" &&
+      typeof entry.text === "string" &&
+      normalizeSeatId(entry.targetSeatId) === targetSeatId
+    ));
 }
 
 function readSessionHeaderText(filePath, maxBytes = 16384) {
@@ -423,6 +449,36 @@ function buildAnswerSignaturePayload(sessionName, challenge, entry) {
   });
 }
 
+function buildContinuationEntry(sourceSessionName, targetSeatId, entry) {
+  return {
+    id: createId(12),
+    type: "continue",
+    sourceSessionName,
+    sourceSeatId: entry.seatId,
+    targetSeatId,
+    origin: entry.origin || "unknown",
+    text: entry.text,
+    createdAt: entry.createdAt || new Date().toISOString(),
+    chainId: entry.chainId,
+    hop: entry.hop,
+    sourceAnswerId: entry.id,
+    publicKey: entry.publicKey || null,
+    signature: entry.signature || null,
+  };
+}
+
+function getSeatDirIfExists(sessionName, seatId) {
+  const dir = path.join(getStateRoot(), "sessions", sessionName, `seat-${seatId}`);
+  try {
+    if (fs.statSync(dir).isDirectory()) {
+      return dir;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 function readSeatChallenge(paths, sessionName) {
   const record = readJson(paths.challengePath, null);
   if (
@@ -520,7 +576,11 @@ class ArmedSeat {
     this.partnerSeatId = getPartnerSeatId(options.seatId);
     this.anchorSeatId = isAnchorSeat(options.seatId) ? options.seatId : this.partnerSeatId;
     this.flowMode = normalizeFlowMode(options.flowMode);
+    this.continueSeatId = normalizeContinueSeatId(options.continueSeatId);
     this.cwd = normalizeWorkingPath(options.cwd);
+    if (this.continueSeatId === this.seatId) {
+      throw new Error(`\`muuuuse ${this.seatId}\` cannot continue to itself.`);
+    }
     this.sessionName = resolveSessionName(this.cwd, this.seatId);
     if (!this.sessionName) {
       throw new Error(
@@ -530,6 +590,7 @@ class ArmedSeat {
     this.sessionPaths = getSessionPaths(this.sessionName);
     this.paths = getSeatPaths(this.sessionName, this.seatId);
     this.partnerPaths = getSeatPaths(this.sessionName, this.partnerSeatId);
+    this.continueOffset = getFileSize(this.paths.continuePath);
     this.partnerOffset = getFileSize(this.partnerPaths.eventsPath);
 
     this.child = null;
@@ -593,6 +654,7 @@ class ArmedSeat {
       partnerSeatId: this.partnerSeatId,
       sessionName: this.sessionName,
       flowMode: this.flowMode,
+      continueSeatId: this.continueSeatId,
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
@@ -608,6 +670,7 @@ class ArmedSeat {
       partnerSeatId: this.partnerSeatId,
       sessionName: this.sessionName,
       flowMode: this.flowMode,
+      continueSeatId: this.continueSeatId,
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
@@ -952,6 +1015,44 @@ class ArmedSeat {
     return Number.isFinite(requestedAtMs) && requestedAtMs > this.startedAtMs;
   }
 
+  findContinuationTarget() {
+    if (!this.continueSeatId) {
+      return null;
+    }
+
+    const candidates = listSessionNames()
+      .map((sessionName) => {
+        if (!getSeatDirIfExists(sessionName, this.continueSeatId)) {
+          return null;
+        }
+
+        const seat = buildSeatReport(sessionName, this.continueSeatId);
+        if (!seat || !matchesWorkingPath(seat.cwd, this.cwd)) {
+          return null;
+        }
+
+        const updatedAtMs = Date.parse(seat.updatedAt || seat.startedAt || "");
+        return {
+          seat,
+          sessionName,
+          updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : 0,
+        };
+      })
+      .filter((entry) => entry !== null)
+      .sort((left, right) => right.updatedAtMs - left.updatedAtMs);
+
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    const target = candidates[0];
+    return {
+      seatId: target.seat.seatId,
+      sessionName: target.sessionName,
+      paths: getSeatPaths(target.sessionName, target.seat.seatId),
+    };
+  }
+
   async pullPartnerEvents() {
     const { nextOffset, text } = readAppendedText(this.partnerPaths.eventsPath, this.partnerOffset);
     this.partnerOffset = nextOffset;
@@ -1011,6 +1112,53 @@ class ArmedSeat {
       this.relayCount += 1;
       this.rememberInboundRelay(payload);
       this.log(`[${this.partnerSeatId} -> ${this.seatId}] ${previewText(payload)}`);
+    }
+  }
+
+  async pullContinuationEvents() {
+    const { nextOffset, text } = readAppendedText(this.paths.continuePath, this.continueOffset);
+    this.continueOffset = nextOffset;
+    if (!text.trim() || !this.child || this.stopped) {
+      return;
+    }
+
+    const entries = parseContinueEntries(text, this.seatId);
+    for (const entry of entries) {
+      if (this.stopped || this.stopRequested()) {
+        this.requestStop("stop_requested");
+        return;
+      }
+
+      const payload = sanitizeRelayText(entry.text);
+      if (!payload) {
+        continue;
+      }
+
+      const delivered = await sendTextAndEnter(
+        this.child,
+        payload,
+        () => this.stopped || this.stopRequested() || !this.child || Boolean(this.childExit)
+      );
+      if (!delivered) {
+        this.requestStop("relay_aborted");
+        return;
+      }
+
+      if (this.stopped || this.stopRequested()) {
+        this.requestStop("stop_requested");
+        return;
+      }
+
+      const deliveredAtMs = Date.now();
+      this.pendingInboundContext = {
+        chainId: entry.chainId || entry.sourceAnswerId || entry.id,
+        deliveredAtMs,
+        expiresAtMs: deliveredAtMs + PENDING_RELAY_CONTEXT_TTL_MS,
+        hop: Number.isInteger(entry.hop) ? entry.hop : 0,
+      };
+      this.relayCount += 1;
+      this.rememberInboundRelay(payload);
+      this.log(`[${entry.sourceSeatId} => ${this.seatId}] ${previewText(payload)}`);
     }
   }
 
@@ -1280,9 +1428,26 @@ class ArmedSeat {
       this.identity.privateKey
     );
     appendJsonl(this.paths.eventsPath, signedEntry);
+    this.forwardContinuation(signedEntry);
     this.rememberEmittedAnswer(answerKey);
 
     this.log(`[${this.seatId}] ${previewText(payload)}`);
+  }
+
+  forwardContinuation(signedEntry) {
+    if (!this.continueSeatId) {
+      return;
+    }
+
+    const target = this.findContinuationTarget();
+    if (!target) {
+      this.log(`[${this.seatId}] continue ${this.continueSeatId} unavailable`);
+      return;
+    }
+
+    const continuationEntry = buildContinuationEntry(this.sessionName, target.seatId, signedEntry);
+    appendJsonl(target.paths.continuePath, continuationEntry);
+    this.log(`[${this.seatId} => ${target.seatId}] ${previewText(continuationEntry.text)}`);
   }
 
   async tick() {
@@ -1298,6 +1463,7 @@ class ArmedSeat {
 
     this.syncTrustState();
     await this.pullPartnerEvents();
+    await this.pullContinuationEvents();
     if (this.stopped || this.stopRequested()) {
       this.requestStop("stop_requested");
       return;
@@ -1330,6 +1496,9 @@ class ArmedSeat {
     this.log(`${BRAND} seat ${this.seatId} armed for ${this.sessionName}.`);
     this.log("Use this shell normally. Codex, Claude, and Gemini relay automatically from their local session logs.");
     this.log(`Seat ${this.seatId} relay mode is flow ${this.flowMode}.`);
+    if (this.continueSeatId) {
+      this.log(`Seat ${this.seatId} continues to seat ${this.continueSeatId}.`);
+    }
     if (isAnchorSeat(this.seatId)) {
       this.log(`Seat ${this.seatId} generated the session key and is waiting for seat ${this.partnerSeatId} to sign it.`);
     } else {
@@ -1431,6 +1600,7 @@ function buildSeatReport(sessionName, seatId) {
     seatId,
     state: wrapperLive ? status?.state || "running" : "orphaned_child",
     flowMode: status?.flowMode || meta?.flowMode || "off",
+    continueSeatId: status?.continueSeatId || meta?.continueSeatId || null,
     wrapperPid,
     childPid,
     wrapperLive,
