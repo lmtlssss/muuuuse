@@ -311,7 +311,6 @@ function usage() {
     "  9. Run `muuuuse status` or `muuuuse stop` from any shell.",
     "",
     "Notes:",
-    "  - No tmux.",
     "  - `muuuuse stop` and `muuuuse status` work from another terminal or the same one.",
     "  - State lives under `~/.muuuuse`.",
   ].join("\n");

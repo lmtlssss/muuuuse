@@ -1,6 +1,6 @@
 # 🔌Muuuuse
 
-`🔌Muuuuse` is a tiny no-tmux terminal relay.
+`🔌Muuuuse` is a tiny terminal relay.
 
 It does one job:
 - arm terminal one with `muuuuse 1`
@@ -76,12 +76,10 @@ muuuuse stop
 
 ## Notes
 
-- no tmux
 - state lives under `~/.muuuuse`
 - only the signed armed pair can exchange relay events
 - `continue <seat>` is a separate local forwarding lane and can target any armed seat number
 - supported relay detection is built for Codex, Claude, and Gemini
-- `codeman` remains the larger transport/control layer; `muuuuse` stays local and minimal
 
 ## Install
 
