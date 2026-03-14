@@ -56,6 +56,32 @@ const CHILD_ENV_DROP_KEYS = [
   "CODEX_THREAD_ID",
 ];
 
+function bestEffortEnableChildEcho(child) {
+  const ptsName = String(child?.ptsName || "").trim();
+  if (!ptsName || process.platform === "win32") {
+    return;
+  }
+
+  try {
+    execFileSync("stty", [
+      "-F",
+      ptsName,
+      "echo",
+      "icanon",
+      "isig",
+      "iexten",
+      "echoe",
+      "echok",
+      "echoke",
+      "echoctl",
+    ], {
+      stdio: "ignore",
+    });
+  } catch {
+    // Best effort only. The shell or child app may later change its own tty mode.
+  }
+}
+
 function normalizeFlowMode(flowMode) {
   return String(flowMode || "").trim().toLowerCase() === "on" ? "on" : "off";
 }
@@ -874,6 +900,7 @@ class ArmedSeat {
       env: childEnv,
       name: childEnv.TERM,
     });
+    bestEffortEnableChildEcho(this.child);
 
     this.childPid = this.child.pid;
     this.writeMeta();
