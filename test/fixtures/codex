@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-exec -a codex node /root/lmtlssss/muuuuse/test/fixtures/noisy-codex.js "$@"
+exec -a codex node /root/muuuuse/test/fixtures/noisy-codex.js "$@"
