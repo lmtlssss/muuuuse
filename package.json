@@ -40,8 +40,7 @@
   ],
   "scripts": {
     "test": "node test/cli.test.js",
-    "pack:local": "npm pack",
-    "prepublishOnly": "npm test"
+    "pack:local": "npm pack"
   },
   "dependencies": {
     "node-pty": "^1.1.0"
