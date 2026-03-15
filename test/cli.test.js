@@ -90,7 +90,7 @@ function testRejectsExtraArgs() {
       stdio: "pipe",
       env: process.env,
     });
-  }, /accepts no extra arguments, `flow on` \/ `flow off`, optional `continue <seat>`, or both in sequence/i);
+  }, /accepts no extra arguments/i);
 }
 
 function testCodexParsing() {
@@ -1145,8 +1145,8 @@ async function testContinuationTargetsChainAcrossPairs() {
       cwd,
       env: buildEnv(home),
     });
-    assert.match(liveStatus, /seat 2: running .*continue 3/i);
-    assert.match(liveStatus, /seat 4: running .*continue 1/i);
+    assert.match(liveStatus, /seat 2: running .*link 3/i);
+    assert.match(liveStatus, /seat 4: running .*link 1/i);
 
     seat1.write("ignite\r");
 
