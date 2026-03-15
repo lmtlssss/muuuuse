@@ -9,7 +9,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const BRAND = "🔌Muuuuse";
+const BRAND = "🔌Muuuuse v5.5.4";
 const POLL_MS = 220;
 const MAX_RELAY_CHARS = 4000;
 const SESSION_MATCH_WINDOW_MS = 5 * 60 * 1000;
@@ -282,7 +282,7 @@ function listSessionNames() {
 
 function usage() {
   return [
-    `${BRAND} arms regular terminals in isolated odd/even pairs and relays assistant output between each pair.`,
+    `${BRAND} relay protocol for long-horizon zero-drift agentic code loops. agents relay output between paired terminals, converging to lucid conclusions.`,
     "",
     "Usage:",
     "  muuuuse 1",
