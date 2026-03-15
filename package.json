@@ -1,6 +1,6 @@
 {
   "name": "muuuuse",
-  "version": "2.3.3",
+  "version": "5.5.4",
   "description": "🔌Muuuuse arms regular terminals in isolated pairs and can continue relay output into any other armed seat.",
   "type": "commonjs",
   "bin": {
