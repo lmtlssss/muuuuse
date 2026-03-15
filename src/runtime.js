@@ -542,6 +542,20 @@ class ArmedSeat {
     this.seatId = options.seatId;
     this.continueTargets = Array.isArray(options.continueTargets) ? options.continueTargets : [];
     this.cwd = normalizeWorkingPath(options.cwd);
+
+    // Auto-link partner seat for backwards compatibility (seat 1→2, seat 2→1)
+    // This preserves v5 behavior where odd seats (anchor) initiate relay to even (partner)
+    if (this.continueTargets.length === 0) {
+      if (this.seatId === 1) {
+        // Seat 1 (odd/anchor) relays to seat 2
+        this.continueTargets.push({ targetSeatId: 2, flowMode: "on" });
+      } else if (this.seatId === 3) {
+        // Seat 3 relays to seat 4
+        this.continueTargets.push({ targetSeatId: 4, flowMode: "on" });
+      }
+      // Even seats don't auto-link (they receive from odd partners)
+    }
+
     if (this.continueTargets.some((t) => t.targetSeatId === this.seatId)) {
       throw new Error(`\`muuuuse ${this.seatId}\` cannot relay to itself.`);
     }
