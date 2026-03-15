@@ -1,0 +1,265 @@
+================================================================================
+MUUUUSE v6 ARCHITECTURE DESIGN - EXECUTIVE SUMMARY
+================================================================================
+
+CURRENT STATE (v5):
+- Odd/even paired relay: seats 1↔2, 3↔4, 5↔6 only
+- Single partner per seat
+- Anchor seat (odd) initiates, partner (even) responds
+- Flow mode: per-seat (all relay targets get same mode)
+- Session: even seats must wait for odd seats to start first
+
+NEW STATE (v6):
+- Free-form relay: any seat can relay to any other seat
+- Multiple independent targets per seat
+- Per-target flow modes (seat 1 → 2 [flow on], seat 1 → 3 [flow off])
+- Symmetric trust: any seat can initiate pairing with any other
+- Session: any seat can create or join independently
+
+================================================================================
+KEY FILES NEEDING CHANGES
+================================================================================
+
+1. src/util.js - SMALL CHANGES
+   - REMOVE: getPartnerSeatId() (lines 182-188)
+   - REMOVE: isAnchorSeat() (lines 178-180)
+   Impact: ~10 lines deleted, low risk
+
+2. src/cli.js - MEDIUM CHANGES
+   - REMOVE: renderLinkTargets() (lines 87-95) - rewrite
+   - REWRITE: parseLinkTargets() (lines 214-244)
+   - MODIFY: parseSeatOptions() (lines 125-178)
+   - MODIFY: renderSeatStatus() (lines 74-106)
+   - MODIFY: main() (lines 60-66)
+   Impact: ~30% of file, medium risk
+
+3. src/runtime.js - MAJOR CHANGES
+   - REMOVE: 5 functions (findJoinableSessionName, waitForJoinableSessionName, 
+     resolveSessionName, syncSeatOneTrust, syncSeatTwoTrust)
+   - REMOVE: 2 more functions (isPaired, pullPartnerEvents, partnerIsLive)
+   - REMOVE: 8 properties from ArmedSeat (partnerSeatId, anchorSeatId, 
+     continueSeatId, continueTargets, partnerPaths, partnerOffset, trustState)
+   - ADD: 7 new methods (createOrJoinSessionName, syncMultiTargetTrust, 
+     syncTargetTrust, initiateTargetPairing, respondToTargetPairing, 
+     pullInboundRelays + helpers)
+   - ADD: 4 new properties (relayTargets, relayTargetPaths, targetOffsets, 
+     targetKeys, targetChallenges)
+   - MODIFY: constructor, launchShell, emitAnswer, tick, writeStatus, writeMeta
+   Impact: ~40% rewrite, high risk
+
+4. src/agents.js - NO CHANGES
+   Impact: zero
+
+5. package.json - TRIVIAL
+   - Version: 5.5.4 → 6.0.0
+   - Description update
+   Impact: low
+
+6. README.md - DOCUMENTATION
+   - Update command examples and explanations
+   Impact: low
+
+================================================================================
+COMMAND SYNTAX CHANGE
+================================================================================
+
+OLD (v5):
+  muuuuse 1 flow on              # Odd: creates session
+  muuuuse 2 flow off             # Even: joins
+  muuuuse 3                      # Odd: creates new pair
+  muuuuse 4 continue 1           # Even: forwards to 1 (keeps 3/4 pair)
+
+NEW (v6):
+  muuuuse 1 link 2 flow on              # Seat 1 relays to 2
+  muuuuse 2 link 1 flow off             # Seat 2 relays to 1
+  muuuuse 3 link 1 flow on 2 flow off   # Seat 3 relays to 1&2, different modes
+  muuuuse 4 link 2 flow on 3 flow on    # Seat 4 relays to 2&3
+
+No constraints on order. Any seat can start anytime.
+
+================================================================================
+TRUST MODEL TRANSFORMATION
+================================================================================
+
+v5: Anchor/Partner Roles (ID-Based)
+  - Odd seat (1,3,5...): generates challenge, waits for signature
+  - Even seat (2,4,6...): signs challenge, initiates signature
+  - One challenge per session
+  - Files: challenge.json, claim.json, ack.json
+
+v6: Symmetric Pairing (First-Writer Wins)
+  - Any seat can initiate with any other
+  - First to write "initiator_challenge.json" is initiator
+  - Second to see it writes "responder_signature.json"
+  - Per-target challenges: seat-1 has different challenges for seat 2 vs 3
+  - Per-target signing: answer signed once with each target's challenge
+
+FILES STRUCTURE (v6 example):
+  ~/.muuuuse/sessions/{sessionName}/seat-1/
+    id_ed25519                    ← seat's keypair
+    events.jsonl                  ← answers this seat emits
+    target-2/
+      initiator_challenge.json    ← if seat 1 initiated with 2
+      responder_signature.json    ← if seat 2 responded to 1
+    target-3/
+      initiator_challenge.json    ← if seat 1 initiated with 3
+      responder_signature.json    ← if seat 3 responded to 1
+
+================================================================================
+RELAY FLOW TRANSFORMATION
+================================================================================
+
+v5 (Single Partner):
+  Seat 1 creates answer
+    ↓ signs with challenge-1-2
+    ↓ writes to events.jsonl
+  
+  Seat 2 reads events.jsonl
+    ↓ verifies signature with partner key
+    ↓ accepts/rejects by flowMode
+    ↓ types into shell
+
+v6 (Multiple Targets):
+  Seat 1 creates answer
+    ↓ for each relay target (2, 3, 5...):
+    ├─ signs with challenge-for-target
+    ├─ writes to target's events file
+    │
+  Seat 2 reads events with flow mode "on"
+    ↓ verifies signature with target-specific key
+  Seat 3 reads events with flow mode "off"
+    ↓ verifies signature with target-specific key
+  Seat 5 reads events with flow mode "on"
+    ↓ verifies signature with target-specific key
+
+One answer → N signatures (one per target with target's challenge)
+
+================================================================================
+IMPLEMENTATION STRATEGY
+================================================================================
+
+PHASE 1: Foundation (util.js)
+  1. Remove getPartnerSeatId() and isAnchorSeat()
+  2. All references in other files will break (expected)
+
+PHASE 2: Core (runtime.js)
+  1. Add createOrJoinSessionName() function
+  2. Refactor ArmedSeat constructor for relayTargets
+  3. Add per-target trust sync methods
+  4. Rewrite emitAnswer() for multi-target signatures
+  5. Rewrite pullInboundRelays() for multiple targets
+
+PHASE 3: CLI (cli.js)
+  1. Rewrite parseLinkTargets() for uniform targets
+  2. Update parseSeatOptions() to use relayTargets
+  3. Update status rendering
+
+PHASE 4: Polish
+  1. Update package.json version
+  2. Update README with new examples
+  3. Run test suite
+  4. Manual testing: 1→2, 1→2→3, 1→2,3 topologies
+
+================================================================================
+KEY DESIGN PRINCIPLES
+================================================================================
+
+1. NO IMPLICIT PAIRING
+   Every relay connection is explicit in the command.
+   No computed partners from seat ID.
+
+2. SYMMETRIC TRUST
+   Any two seats can establish trust together.
+   First writer = initiator, second writer = responder.
+
+3. INDEPENDENT TARGETS
+   Each relay path has its own:
+   - Challenge/signature pair
+   - Flow mode setting
+   - Event tracking
+
+4. SESSION CONTAINERS
+   Sessions are just directories for organization.
+   Seats join based on: cwd match + not stopped.
+   No implicit pairing needed to find each other.
+
+5. SIMPLE SYNTAX
+   `muuuuse <seatId> link <target1> flow <mode1> [<target2> flow <mode2> ...]`
+   Clear, explicit, no magic numbers.
+
+================================================================================
+RISK ANALYSIS
+================================================================================
+
+HIGH RISK:
+  - Trust synchronization rewrite (many tests needed)
+  - Relay event handling (multiple paths instead of one)
+  - Session join logic (any seat can now join)
+
+MEDIUM RISK:
+  - CLI parsing changes (need comprehensive test cases)
+  - Status display changes (test output format)
+
+LOW RISK:
+  - Removing odd/even functions (clean cut)
+  - Package.json changes (trivial)
+  - Agent detection (untouched)
+
+MITIGATION:
+  - Comprehensive test suite before v6 release
+  - Backward compat: keep .jsonl format identical
+  - Gradual refactoring: remove functions before rewriting usage
+  - Clear commit messages for each logical change
+
+================================================================================
+TESTING CHECKLIST
+================================================================================
+
+UNIT TESTS:
+  [ ] createOrJoinSessionName() - new session, existing session
+  [ ] syncTargetTrust() - initiator, responder, both
+  [ ] Per-target flow modes applied correctly
+  [ ] Self-relay rejected in constructor
+
+INTEGRATION TESTS:
+  [ ] 1 → 2 (simple pair)
+  [ ] 1 ↔ 2 (mutual relay)
+  [ ] 1 → 2 → 3 (relay chain)
+  [ ] 1 → {2, 3} (fan-out)
+  [ ] Complex: 1→{2,3}, 2→{1,3}, 3→{1,2} (full mesh)
+
+FLOW MODE TESTS:
+  [ ] Target 2 with flow=on gets commentary
+  [ ] Target 3 with flow=off gets only final answers
+  [ ] Different targets see different content
+
+BACKWARD COMPAT:
+  [ ] .jsonl event format unchanged
+  [ ] Session files readable by v5 tools
+  [ ] Status display migration path
+
+EDGE CASES:
+  [ ] Seat joins after relay started
+  [ ] Target becomes unavailable
+  [ ] Multiple agents in one seat
+  [ ] Rapid relay cycles (no loops)
+
+================================================================================
+DELIVERABLES
+================================================================================
+
+✓ ARCHITECTURE_v6.md - Full architectural design (65KB)
+✓ CHANGES_v6_DETAILED.md - Line-by-line change list (80KB)
+✓ v6_QUICK_REFERENCE.md - Quick lookup guide (15KB)
+✓ v6_CODE_PATTERNS.md - Before/after code examples (45KB)
+✓ DESIGN_SUMMARY.txt - This document (this file)
+
+READY FOR IMPLEMENTATION:
+- Clear requirements
+- Exact file locations
+- Line numbers for changes
+- Code patterns showing transformations
+- Risk assessment
+- Testing strategy
+
+================================================================================

@@ -76,9 +76,9 @@ function testUsage() {
   assert.match(output, /muuuuse 1/);
   assert.match(output, /muuuuse 2/);
   assert.match(output, /muuuuse 3/);
-  assert.match(output, /muuuuse 4/);
-  assert.match(output, /continue 3/);
-  assert.match(output, /continue 1/);
+  assert.match(output, /link 2 flow on/);
+  assert.match(output, /link 3 flow on/);
+  assert.match(output, /flow off/);
   assert.match(output, /muuuuse status/);
   assert.match(output, /muuuuse stop/);
 }
@@ -1293,7 +1293,7 @@ async function testStopSilencesBellLoop() {
 }
 
 async function runRelayCycle({ cycle, cwd, home }) {
-  const seat1 = spawnSeat(1, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["link", "2", "flow", "on"] });
   const seat2 = spawnSeat(2, { cwd, home });
 
   try {

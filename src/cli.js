@@ -1,4 +1,4 @@
-const { BRAND, getPartnerSeatId, normalizeSeatId, usage } = require("./util");
+const { BRAND, normalizeSeatId, usage } = require("./util");
 const { ArmedSeat, getStatusReport, stopAllSessions } = require("./runtime");
 
 async function main(argv = process.argv.slice(2)) {
@@ -56,12 +56,10 @@ async function main(argv = process.argv.slice(2)) {
 
   const seatId = normalizeSeatId(command);
   if (seatId) {
-    const { flowMode, continueSeatId, continueTargets } = parseSeatOptions(command, argv.slice(1));
+    const { continueTargets } = parseSeatOptions(command, argv.slice(1));
     const seat = new ArmedSeat({
       cwd: process.cwd(),
       continueTargets,
-      continueSeatId,
-      flowMode,
       seatId,
     });
     const code = await seat.run();
@@ -75,15 +73,11 @@ function renderSeatStatus(seat) {
   const bits = [
     `seat ${seat.seatId}: ${seat.state}`,
     `agent ${seat.agent || "idle"}`,
-    `flow ${seat.flowMode || "off"}`,
     `relays ${seat.relayCount}`,
     `wrapper ${seat.wrapperPid || "-"}`,
     `child ${seat.childPid || "-"}`,
   ];
 
-  if (seat.partnerLive) {
-    bits.push("peer live");
-  }
   const renderedLinks = renderLinkTargets(seat);
   if (renderedLinks) {
     bits.push(`link ${renderedLinks}`);
@@ -106,17 +100,7 @@ function renderSeatStatus(seat) {
 }
 
 function renderLinkTargets(seat) {
-  const targets = [];
-  if (seat.partnerSeatId) {
-    targets.push({
-      targetSeatId: seat.partnerSeatId,
-      flowMode: seat.flowMode || "off",
-    });
-  }
-  for (const target of Array.isArray(seat.continueTargets) ? seat.continueTargets : []) {
-    targets.push(target);
-  }
-
+  const targets = Array.isArray(seat.continueTargets) ? seat.continueTargets : [];
   return targets
     .map((target) => `${target.targetSeatId}:${target.flowMode}`)
     .join(", ");
@@ -124,41 +108,16 @@ function renderLinkTargets(seat) {
 
 function parseSeatOptions(command, args) {
   const seatId = normalizeSeatId(command);
-  let flowMode = "off";
-  let continueSeatId = null;
   let continueTargets = [];
   let index = 0;
 
   while (index < args.length) {
     const token = String(args[index] || "").trim().toLowerCase();
 
-    if (token === "flow") {
-      const flowToken = String(args[index + 1] || "").trim().toLowerCase();
-      if (flowToken === "on" || flowToken === "off") {
-        flowMode = flowToken;
-        index += 2;
-        continue;
-      }
-      break;
-    }
-
-    if (token === "continue") {
-      const parsedTargets = parseContinueTargets(args.slice(index + 1), flowMode);
-      if (parsedTargets.targets.length > 0) {
-        continueTargets = mergeTargets(continueTargets, parsedTargets.targets);
-        continueSeatId = continueTargets[0].targetSeatId;
-        index += 1 + parsedTargets.consumed;
-        continue;
-      }
-      break;
-    }
-
     if (token === "link") {
-      const parsedLinks = parseLinkTargets(args.slice(index + 1), seatId, flowMode);
+      const parsedLinks = parseLinkTargets(args.slice(index + 1), seatId);
       if (parsedLinks.consumed > 0) {
-        flowMode = parsedLinks.flowMode;
         continueTargets = mergeTargets(continueTargets, parsedLinks.continueTargets);
-        continueSeatId = continueTargets[0]?.targetSeatId || null;
         index += 1 + parsedLinks.consumed;
         continue;
       }
@@ -169,11 +128,11 @@ function parseSeatOptions(command, args) {
   }
 
   if (index === args.length) {
-    return { flowMode, continueSeatId, continueTargets };
+    return { continueTargets };
   }
 
   throw new Error(
-    `\`muuuuse ${command}\` accepts no extra arguments, \`flow on\` / \`flow off\`, optional \`continue <seat>\`, or \`link <seat> flow on [<seat> flow off ...]\`. Run it directly in the terminal you want to arm.`
+    `\`muuuuse ${command}\` accepts no extra arguments or \`link <seat> flow on [<seat> flow off ...]\`. Run it directly in the terminal you want to arm.`
   );
 }
 
@@ -189,32 +148,8 @@ function mergeTargets(existingTargets, nextTargets) {
   return merged;
 }
 
-function parseContinueTargets(args, defaultFlowMode) {
-  const targets = [];
-  let consumed = 0;
-
-  while (consumed < args.length) {
-    const targetSeatId = normalizeSeatId(args[consumed]);
-    if (!targetSeatId) {
-      break;
-    }
-
-    const nextFlowMode = parseFlowModeToken(args[consumed + 1], args[consumed + 2]);
-    const target = {
-      targetSeatId,
-      flowMode: nextFlowMode || defaultFlowMode,
-    };
-    upsertTarget(targets, target);
-    consumed += nextFlowMode ? 3 : 1;
-  }
-
-  return { consumed, targets };
-}
-
-function parseLinkTargets(args, seatId, defaultFlowMode) {
-  const partnerSeatId = seatId ? getPartnerSeatId(seatId) : null;
+function parseLinkTargets(args, seatId) {
   const continueTargets = [];
-  let flowMode = defaultFlowMode;
   let consumed = 0;
 
   while (consumed < args.length) {
@@ -228,19 +163,15 @@ function parseLinkTargets(args, seatId, defaultFlowMode) {
       break;
     }
 
-    if (targetSeatId === partnerSeatId) {
-      flowMode = targetFlowMode;
-    } else {
-      upsertTarget(continueTargets, {
-        targetSeatId,
-        flowMode: targetFlowMode,
-      });
-    }
+    upsertTarget(continueTargets, {
+      targetSeatId,
+      flowMode: targetFlowMode,
+    });
 
     consumed += 3;
   }
 
-  return { consumed, continueTargets, flowMode };
+  return { consumed, continueTargets };
 }
 
 function parseFlowModeToken(flowToken, modeToken) {

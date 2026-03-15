@@ -9,7 +9,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const BRAND = "🔌Muuuuse v5.5.4";
+const BRAND = "🔌Muuuuse v6.0.0";
 const POLL_MS = 220;
 const MAX_RELAY_CHARS = 4000;
 const SESSION_MATCH_WINDOW_MS = 5 * 60 * 1000;
@@ -175,17 +175,6 @@ function normalizeSeatId(value) {
   return seatId;
 }
 
-function isAnchorSeat(seatId) {
-  return normalizeSeatId(seatId) % 2 === 1;
-}
-
-function getPartnerSeatId(seatId) {
-  const normalized = normalizeSeatId(seatId);
-  if (!normalized) {
-    return null;
-  }
-  return isAnchorSeat(normalized) ? normalized + 1 : normalized - 1;
-}
 
 function listSeatIds(sessionName) {
   const sessionDir = getSessionDir(sessionName);
@@ -282,36 +271,28 @@ function listSessionNames() {
 
 function usage() {
   return [
-    `${BRAND} relay protocol for long-horizon zero-drift agentic code loops. agents relay output between paired terminals, converging to lucid conclusions.`,
+    `${BRAND} relay protocol for long-horizon zero-drift agentic code loops. agents relay output between terminals, converging to lucid conclusions.`,
     "",
     "Usage:",
     "  muuuuse 1",
-    "  muuuuse 1 flow on",
-    "  muuuuse 1 flow off",
-    "  muuuuse 1 flow on continue 3",
+    "  muuuuse 1 link 2 flow on",
+    "  muuuuse 1 link 2 flow on 3 flow off",
     "  muuuuse 2",
-    "  muuuuse 2 flow on",
-    "  muuuuse 2 flow off",
-    "  muuuuse 2 flow on continue 3",
+    "  muuuuse 2 link 3 flow on",
     "  muuuuse 3",
-    "  muuuuse 4",
-    "  muuuuse 4 flow on continue 1",
     "  muuuuse stop",
     "  muuuuse status",
     "",
     "Flow:",
-    "  1. Run `muuuuse 1` in terminal one.",
-    "  2. Run `muuuuse 2` in terminal two.",
-    "  3. The odd seat generates the session key and the matching even seat signs it automatically.",
-    "  4. Additional pairs work the same way: `3/4`, `5/6`, `7/8`...",
-    "  5. Optional: arm each seat with `flow on` or `flow off`.",
-    "  6. Optional: add `continue <seat>` to forward that seat's relayed output into another armed seat.",
-    "  7. Use those armed shells normally.",
-    "  8. `flow off` sends final answers only. `flow on` keeps assistant commentary bouncing.",
-    "  9. Run `muuuuse status` or `muuuuse stop` from any shell.",
+    "  1. Run `muuuuse <seat>` in each terminal to arm it (any seat number, any count).",
+    "  2. Optionally add `link <target> flow on/off [<target> flow on/off ...]` to relay output to other seats.",
+    "  3. Use those armed shells normally. Codex, Claude, and Gemini relay automatically from their local session logs.",
+    "  4. `flow off` sends final answers only. `flow on` sends both commentary and final answers.",
+    "  5. Run `muuuuse status` or `muuuuse stop` from any terminal.",
     "",
     "Notes:",
-    "  - `muuuuse stop` and `muuuuse status` work from another terminal or the same one.",
+    "  - Any seat can relay to any other seat independently.",
+    "  - `muuuuse stop` and `muuuuse status` work from any terminal.",
     "  - State lives under `~/.muuuuse`.",
   ].join("\n");
 }
@@ -325,9 +306,7 @@ module.exports = {
   ensureDir,
   getDefaultSessionName,
   getFileSize,
-  getPartnerSeatId,
   loadOrCreateSeatIdentity,
-  isAnchorSeat,
   getSeatPaths,
   getSessionPaths,
   getStateRoot,

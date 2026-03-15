@@ -20,12 +20,10 @@ const {
   ensureDir,
   getDefaultSessionName,
   getFileSize,
-  getPartnerSeatId,
   getSeatPaths,
   getSessionPaths,
   getStateRoot,
   hashText,
-  isAnchorSeat,
   isPidAlive,
   listSeatIds,
   loadOrCreateSeatIdentity,
@@ -142,42 +140,19 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function findJoinableSessionName(currentPath = process.cwd(), seatId = 2) {
-  const normalizedSeatId = normalizeSeatId(seatId);
-  const anchorSeatId = getPartnerSeatId(normalizedSeatId);
-  if (!normalizedSeatId || !anchorSeatId || isAnchorSeat(normalizedSeatId)) {
-    return null;
-  }
-
+function findExistingSessionName(currentPath = process.cwd()) {
   const candidates = listSessionNames()
     .map((sessionName) => {
       const sessionPaths = getSessionPaths(sessionName);
       const controller = readJson(sessionPaths.controllerPath, null);
-      const anchorPaths = getSeatPaths(sessionName, anchorSeatId);
-      const seatPaths = getSeatPaths(sessionName, normalizedSeatId);
-      const anchorMeta = readJson(anchorPaths.metaPath, null);
-      const anchorStatus = readJson(anchorPaths.statusPath, null);
-      const seatMeta = readJson(seatPaths.metaPath, null);
-      const seatStatus = readJson(seatPaths.statusPath, null);
-      const stopRequest = readJson(sessionPaths.stopPath, null);
-
-      const cwd = controller?.cwd || anchorStatus?.cwd || anchorMeta?.cwd || seatStatus?.cwd || seatMeta?.cwd || null;
+      const cwd = controller?.cwd || null;
       if (!matchesWorkingPath(cwd, currentPath)) {
         return null;
       }
 
-      const anchorWrapperPid = anchorStatus?.pid || anchorMeta?.pid || null;
-      const anchorChildPid = anchorStatus?.childPid || anchorMeta?.childPid || null;
-      const seatWrapperPid = seatStatus?.pid || seatMeta?.pid || null;
-      const seatChildPid = seatStatus?.childPid || seatMeta?.childPid || null;
-      const anchorLive = isPidAlive(anchorWrapperPid) || isPidAlive(anchorChildPid);
-      const seatLive = isPidAlive(seatWrapperPid) || isPidAlive(seatChildPid);
+      const stopRequest = readJson(sessionPaths.stopPath, null);
       const stopRequestedAtMs = Date.parse(stopRequest?.requestedAt || "");
-      const createdAtMs = Date.parse(controller?.createdAt || anchorMeta?.startedAt || anchorStatus?.updatedAt || "");
-
-      if (!anchorLive || seatLive) {
-        return null;
-      }
+      const createdAtMs = Date.parse(controller?.createdAt || "");
 
       if (Number.isFinite(stopRequestedAtMs) && Number.isFinite(createdAtMs) && stopRequestedAtMs > createdAtMs) {
         return null;
@@ -194,10 +169,10 @@ function findJoinableSessionName(currentPath = process.cwd(), seatId = 2) {
   return candidates[0]?.sessionName || null;
 }
 
-function waitForJoinableSessionName(currentPath = process.cwd(), seatId = 2, timeoutMs = SEAT_JOIN_WAIT_MS) {
+function waitForExistingSessionName(currentPath = process.cwd(), timeoutMs = SEAT_JOIN_WAIT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
-    const sessionName = findJoinableSessionName(currentPath, seatId);
+    const sessionName = findExistingSessionName(currentPath);
     if (sessionName) {
       return sessionName;
     }
@@ -208,11 +183,12 @@ function waitForJoinableSessionName(currentPath = process.cwd(), seatId = 2, tim
 }
 
 function resolveSessionName(currentPath = process.cwd(), seatId = 1) {
-  if (isAnchorSeat(seatId)) {
-    return createSessionName(currentPath);
+  const existing = findExistingSessionName(currentPath);
+  if (existing) {
+    return existing;
   }
 
-  return waitForJoinableSessionName(currentPath, seatId);
+  return createSessionName(currentPath);
 }
 
 function parseAnswerEntries(text) {
@@ -414,26 +390,6 @@ function resolveSessionFile(agentType, agentPid, currentPath, captureSinceMs, pr
   return null;
 }
 
-function buildClaimMessage(sessionName, challenge, seat1PublicKey, seat2PublicKey) {
-  return JSON.stringify({
-    type: "muuuuse_pair_claim",
-    sessionName,
-    challenge,
-    seat1PublicKey,
-    seat2PublicKey,
-  });
-}
-
-function buildAckMessage(sessionName, challenge, seat1PublicKey, seat2PublicKey) {
-  return JSON.stringify({
-    type: "muuuuse_pair_ack",
-    sessionName,
-    challenge,
-    seat1PublicKey,
-    seat2PublicKey,
-  });
-}
-
 function buildAnswerSignaturePayload(sessionName, challenge, entry) {
   return JSON.stringify({
     type: "muuuuse_answer",
@@ -584,26 +540,21 @@ async function sendTextAndEnter(child, text, shouldAbort = () => false) {
 class ArmedSeat {
   constructor(options) {
     this.seatId = options.seatId;
-    this.partnerSeatId = getPartnerSeatId(options.seatId);
-    this.anchorSeatId = isAnchorSeat(options.seatId) ? options.seatId : this.partnerSeatId;
-    this.flowMode = normalizeFlowMode(options.flowMode);
-    this.continueSeatId = normalizeContinueSeatId(options.continueSeatId);
     this.continueTargets = Array.isArray(options.continueTargets) ? options.continueTargets : [];
     this.cwd = normalizeWorkingPath(options.cwd);
-    if (this.continueSeatId === this.seatId || this.continueTargets.some((t) => t.targetSeatId === this.seatId)) {
-      throw new Error(`\`muuuuse ${this.seatId}\` cannot continue to itself.`);
+    if (this.continueTargets.some((t) => t.targetSeatId === this.seatId)) {
+      throw new Error(`\`muuuuse ${this.seatId}\` cannot relay to itself.`);
     }
-    this.sessionName = resolveSessionName(this.cwd, this.seatId);
+    this.sessionName = resolveSessionName(this.cwd);
     if (!this.sessionName) {
       throw new Error(
-        `No armed \`muuuuse ${this.partnerSeatId}\` seat is waiting in this cwd. Run \`muuuuse ${this.partnerSeatId}\` first.`
+        `Failed to create or find session in ${this.cwd}.`
       );
     }
     this.sessionPaths = getSessionPaths(this.sessionName);
     this.paths = getSeatPaths(this.sessionName, this.seatId);
-    this.partnerPaths = getSeatPaths(this.sessionName, this.partnerSeatId);
     this.continueOffset = getFileSize(this.paths.continuePath);
-    this.partnerOffset = getFileSize(this.partnerPaths.eventsPath);
+    this.relayTargets = {};
 
     this.child = null;
     this.childPid = null;
@@ -623,9 +574,8 @@ class ArmedSeat {
     this.recentEmittedAnswers = [];
     this.trustState = {
       challenge: null,
-      peerPublicKey: null,
-      phase: isAnchorSeat(this.seatId) ? "waiting_for_peer_signature" : "waiting_for_anchor_key",
-      pairedAt: null,
+      phase: "initialized",
+      createdAt: null,
     };
     this.liveState = {
       type: null,
@@ -647,11 +597,6 @@ class ArmedSeat {
       cwd: this.cwd,
       createdAt: current.createdAt || this.startedAt,
       updatedAt: new Date().toISOString(),
-      anchorSeatId: this.anchorSeatId,
-      partnerSeatId: this.partnerSeatId,
-      anchorSeatPid: this.seatId === this.anchorSeatId ? process.pid : current.anchorSeatPid || null,
-      partnerSeatPid: this.seatId === this.partnerSeatId ? process.pid : current.partnerSeatPid || null,
-      pid: this.seatId === this.anchorSeatId ? process.pid : current.pid || null,
       ...extra,
     });
   }
@@ -663,10 +608,7 @@ class ArmedSeat {
   writeMeta(extra = {}) {
     writeJson(this.paths.metaPath, {
       seatId: this.seatId,
-      partnerSeatId: this.partnerSeatId,
       sessionName: this.sessionName,
-      flowMode: this.flowMode,
-      continueSeatId: this.continueSeatId,
       continueTargets: this.continueTargets,
       cwd: this.cwd,
       pid: process.pid,
@@ -680,10 +622,7 @@ class ArmedSeat {
   writeStatus(extra = {}) {
     writeJson(this.paths.statusPath, {
       seatId: this.seatId,
-      partnerSeatId: this.partnerSeatId,
       sessionName: this.sessionName,
-      flowMode: this.flowMode,
-      continueSeatId: this.continueSeatId,
       continueTargets: this.continueTargets,
       cwd: this.cwd,
       pid: process.pid,
@@ -696,168 +635,19 @@ class ArmedSeat {
 
   initializeTrustMaterial() {
     this.identity = loadOrCreateSeatIdentity(this.paths);
-
-    if (!isAnchorSeat(this.seatId)) {
-      return;
-    }
-
     writeJson(this.paths.challengePath, {
       sessionName: this.sessionName,
-      challenge: createId(48),
       publicKey: this.identity.publicKey,
       createdAt: new Date().toISOString(),
     });
-    this.trustState.challenge = readSeatChallenge(this.paths, this.sessionName)?.challenge || null;
-    this.trustState.peerPublicKey = null;
-    this.trustState.phase = "waiting_for_peer_signature";
-    this.trustState.pairedAt = null;
-    fs.rmSync(this.paths.ackPath, { force: true });
-    fs.rmSync(this.partnerPaths.claimPath, { force: true });
+    this.trustState.phase = "initialized";
+    this.trustState.createdAt = new Date().toISOString();
   }
 
   syncTrustState() {
     if (!this.identity) {
       this.initializeTrustMaterial();
     }
-
-    if (isAnchorSeat(this.seatId)) {
-      this.syncSeatOneTrust();
-      return;
-    }
-
-    this.syncSeatTwoTrust();
-  }
-
-  syncSeatOneTrust() {
-    const challengeRecord = readSeatChallenge(this.paths, this.sessionName);
-    if (!challengeRecord || challengeRecord.publicKey !== this.identity.publicKey) {
-      this.trustState = {
-        challenge: null,
-        peerPublicKey: null,
-        phase: "waiting_for_peer_signature",
-        pairedAt: null,
-      };
-      return;
-    }
-
-    this.trustState.challenge = challengeRecord.challenge;
-    const claim = readJson(this.partnerPaths.claimPath, null);
-    if (
-      !claim ||
-      claim.sessionName !== this.sessionName ||
-      claim.challenge !== challengeRecord.challenge ||
-      typeof claim.publicKey !== "string" ||
-      typeof claim.signature !== "string" ||
-      !verifyText(
-        buildClaimMessage(
-          this.sessionName,
-          challengeRecord.challenge,
-          this.identity.publicKey,
-          claim.publicKey.trim()
-        ),
-        claim.signature,
-        claim.publicKey
-      )
-    ) {
-      this.trustState.peerPublicKey = null;
-      this.trustState.phase = "waiting_for_peer_signature";
-      this.trustState.pairedAt = null;
-      fs.rmSync(this.paths.ackPath, { force: true });
-      return;
-    }
-
-    const peerPublicKey = claim.publicKey.trim();
-    const ackMessage = buildAckMessage(this.sessionName, challengeRecord.challenge, this.identity.publicKey, peerPublicKey);
-    const currentAck = readJson(this.paths.ackPath, null);
-    const ackIsValid = Boolean(
-      currentAck &&
-      currentAck.sessionName === this.sessionName &&
-      currentAck.challenge === challengeRecord.challenge &&
-      currentAck.publicKey === this.identity.publicKey &&
-      currentAck.peerPublicKey === peerPublicKey &&
-      typeof currentAck.signature === "string" &&
-      verifyText(ackMessage, currentAck.signature, this.identity.publicKey)
-    );
-    if (!ackIsValid) {
-      writeJson(this.paths.ackPath, {
-        sessionName: this.sessionName,
-        challenge: challengeRecord.challenge,
-        publicKey: this.identity.publicKey,
-        peerPublicKey,
-        signature: signText(ackMessage, this.identity.privateKey),
-        signedAt: new Date().toISOString(),
-      });
-    }
-
-    const ackRecord = ackIsValid ? currentAck : readJson(this.paths.ackPath, null);
-    this.trustState.peerPublicKey = peerPublicKey;
-    this.trustState.phase = "paired";
-    this.trustState.pairedAt = ackRecord?.signedAt || new Date().toISOString();
-  }
-
-  syncSeatTwoTrust() {
-    const challengeRecord = readSeatChallenge(this.partnerPaths, this.sessionName);
-    if (!challengeRecord) {
-      this.trustState = {
-        challenge: null,
-        peerPublicKey: null,
-        phase: "waiting_for_anchor_key",
-        pairedAt: null,
-      };
-      return;
-    }
-
-    const challenge = challengeRecord.challenge;
-    const peerPublicKey = challengeRecord.publicKey;
-    const claimPayload = {
-      sessionName: this.sessionName,
-      challenge,
-      publicKey: this.identity.publicKey,
-    };
-    const claimSignature = signText(
-      buildClaimMessage(this.sessionName, challenge, peerPublicKey, this.identity.publicKey),
-      this.identity.privateKey
-    );
-    const currentClaim = readJson(this.paths.claimPath, null);
-    if (
-      !currentClaim ||
-      currentClaim.sessionName !== claimPayload.sessionName ||
-      currentClaim.challenge !== claimPayload.challenge ||
-      currentClaim.publicKey !== claimPayload.publicKey ||
-      currentClaim.signature !== claimSignature
-    ) {
-      writeJson(this.paths.claimPath, {
-        ...claimPayload,
-        signature: claimSignature,
-        signedAt: new Date().toISOString(),
-      });
-    }
-
-    const ack = readJson(this.partnerPaths.ackPath, null);
-    const paired = Boolean(
-      ack &&
-      ack.sessionName === this.sessionName &&
-      ack.challenge === challenge &&
-      ack.peerPublicKey === this.identity.publicKey &&
-      ack.publicKey === peerPublicKey &&
-      typeof ack.signature === "string" &&
-      verifyText(
-        buildAckMessage(this.sessionName, challenge, peerPublicKey, this.identity.publicKey),
-        ack.signature,
-        peerPublicKey
-      )
-    );
-
-    this.trustState.challenge = challenge;
-    this.trustState.peerPublicKey = peerPublicKey;
-    this.trustState.phase = paired ? "paired" : "waiting_for_pair_ack";
-    this.trustState.pairedAt = paired ? (ack.signedAt || new Date().toISOString()) : null;
-  }
-
-  isPaired() {
-    return this.trustState.phase === "paired" &&
-      typeof this.trustState.challenge === "string" &&
-      typeof this.trustState.peerPublicKey === "string";
   }
 
   launchShell() {
@@ -1014,11 +804,6 @@ class ArmedSeat {
     }
   }
 
-  partnerIsLive() {
-    const partner = readJson(this.partnerPaths.statusPath, null);
-    return Boolean(partner?.pid && isPidAlive(partner.pid));
-  }
-
   stopRequested() {
     const request = readJson(this.sessionPaths.stopPath, null);
     if (!request?.requestedAt) {
@@ -1068,73 +853,6 @@ class ArmedSeat {
     };
   }
 
-  async pullPartnerEvents() {
-    const { nextOffset, text } = readAppendedText(this.partnerPaths.eventsPath, this.partnerOffset);
-    this.partnerOffset = nextOffset;
-    if (!text.trim() || !this.child || this.stopped || !this.isPaired()) {
-      return;
-    }
-
-    const entries = parseAnswerEntries(text);
-    for (const entry of entries) {
-      if (this.stopped || this.stopRequested()) {
-        this.requestStop("stop_requested");
-        return;
-      }
-
-      if (!shouldAcceptInboundEntry(this.flowMode, entry)) {
-        continue;
-      }
-
-      const payload = sanitizeRelayText(entry.text);
-      const signaturePayload = buildAnswerSignaturePayload(this.sessionName, this.trustState.challenge, {
-        chainId: entry.chainId || entry.id,
-        hop: Number.isInteger(entry.hop) ? entry.hop : 0,
-        id: entry.id,
-        seatId: entry.seatId,
-        origin: entry.origin || "unknown",
-        phase: getRelayPhase(entry),
-        createdAt: entry.createdAt,
-        text: payload,
-      });
-      if (
-        !payload ||
-        entry.challenge !== this.trustState.challenge ||
-        entry.publicKey !== this.trustState.peerPublicKey ||
-        typeof entry.signature !== "string" ||
-        !verifyText(signaturePayload, entry.signature, this.trustState.peerPublicKey)
-      ) {
-        continue;
-      }
-
-      const delivered = await sendTextAndEnter(
-        this.child,
-        payload,
-        () => this.stopped || this.stopRequested() || !this.child || Boolean(this.childExit)
-      );
-      if (!delivered) {
-        this.requestStop("relay_aborted");
-        return;
-      }
-
-      if (this.stopped || this.stopRequested()) {
-        this.requestStop("stop_requested");
-        return;
-      }
-
-      const deliveredAtMs = Date.now();
-      this.pendingInboundContext = {
-        chainId: entry.chainId || entry.id,
-        deliveredAtMs,
-        expiresAtMs: deliveredAtMs + PENDING_RELAY_CONTEXT_TTL_MS,
-        hop: Number.isInteger(entry.hop) ? entry.hop : 0,
-      };
-      this.relayCount += 1;
-      this.rememberInboundRelay(payload);
-      this.log(`[${this.partnerSeatId} -> ${this.seatId}] ${previewText(payload)}`);
-    }
-  }
-
   async pullContinuationEvents() {
     const { nextOffset, text } = readAppendedText(this.paths.continuePath, this.continueOffset);
     this.continueOffset = nextOffset;
@@ -1147,10 +865,6 @@ class ArmedSeat {
       if (this.stopped || this.stopRequested()) {
         this.requestStop("stop_requested");
         return;
-      }
-
-      if (!shouldAcceptInboundEntry(this.flowMode, entry)) {
-        continue;
       }
 
       const payload = sanitizeRelayText(entry.text);
@@ -1366,7 +1080,7 @@ class ArmedSeat {
         this.liveState.sessionFile,
         this.liveState.offset,
         this.liveState.captureSinceMs,
-        { flowMode: this.flowMode === "on" }
+        { flowMode: true }
       );
       this.liveState.offset = result.nextOffset;
       answers.push(...result.answers);
@@ -1375,7 +1089,7 @@ class ArmedSeat {
         this.liveState.sessionFile,
         this.liveState.offset,
         this.liveState.captureSinceMs,
-        { flowMode: this.flowMode === "on" }
+        { flowMode: true }
       );
       this.liveState.offset = result.nextOffset;
       answers.push(...result.answers);
@@ -1384,7 +1098,7 @@ class ArmedSeat {
         this.liveState.sessionFile,
         this.liveState.lastMessageId,
         this.liveState.captureSinceMs,
-        { flowMode: this.flowMode === "on" }
+        { flowMode: true }
       );
       this.liveState.lastMessageId = result.lastMessageId;
       this.liveState.offset = result.fileSize;
@@ -1461,21 +1175,13 @@ class ArmedSeat {
   }
 
   forwardContinuation(signedEntry) {
-    // Route to legacy single continueSeatId if set
-    if (this.continueSeatId) {
-      const target = this.findContinuationTarget();
-      if (!target) {
-        this.log(`[${this.seatId}] continue ${this.continueSeatId} unavailable`);
-        return;
-      }
-
-      const continuationEntry = buildContinuationEntry(this.sessionName, target.seatId, signedEntry);
-      appendJsonl(target.paths.continuePath, continuationEntry);
-      this.log(`[${this.seatId} => ${target.seatId}] ${previewText(continuationEntry.text)}`);
-    }
-
     // Route to all continueTargets with per-target flow modes
     for (const targetEntry of this.continueTargets) {
+      // Skip entries that don't match the target's flowMode
+      if (!shouldAcceptInboundEntry(targetEntry.flowMode, signedEntry)) {
+        continue;
+      }
+
       const target = this.findContinuationTarget(targetEntry.targetSeatId);
       if (!target) {
         this.log(`[${this.seatId}] target ${targetEntry.targetSeatId} unavailable`);
@@ -1492,7 +1198,6 @@ class ArmedSeat {
     if (this.stopRequested()) {
       this.writeStatus({
         state: "stopping",
-        partnerLive: this.partnerIsLive(),
         trust: this.trustState.phase,
       });
       this.requestStop("stop_requested");
@@ -1500,7 +1205,6 @@ class ArmedSeat {
     }
 
     this.syncTrustState();
-    await this.pullPartnerEvents();
     await this.pullContinuationEvents();
     if (this.stopped || this.stopRequested()) {
       this.requestStop("stop_requested");
@@ -1515,11 +1219,9 @@ class ArmedSeat {
     this.writeStatus({
       state: live.state,
       agent: live.agent,
-      flowMode: this.flowMode,
       cwd: live.cwd,
       log: live.log,
       lastAnswerAt: live.lastAnswerAt,
-      partnerLive: this.partnerIsLive(),
       trust: this.trustState.phase,
       challengeReady: Boolean(this.trustState.challenge),
     });
@@ -1533,18 +1235,9 @@ class ArmedSeat {
 
     this.log(`${BRAND} seat ${this.seatId} armed for ${this.sessionName}.`);
     this.log("Use this shell normally. Codex, Claude, and Gemini relay automatically from their local session logs.");
-    this.log(`Seat ${this.seatId} relay mode is flow ${this.flowMode}.`);
-    if (this.continueSeatId) {
-      this.log(`Seat ${this.seatId} continues to seat ${this.continueSeatId}.`);
-    }
     if (this.continueTargets.length > 0) {
-      const targets = this.continueTargets.map((t) => `${t.targetSeatId} (${t.flowMode})`).join(", ");
-      this.log(`Seat ${this.seatId} links to ${targets}.`);
-    }
-    if (isAnchorSeat(this.seatId)) {
-      this.log(`Seat ${this.seatId} generated the session key and is waiting for seat ${this.partnerSeatId} to sign it.`);
-    } else {
-      this.log(`Seat ${this.seatId} will sign the session key from seat ${this.partnerSeatId}, then relay goes live.`);
+      const targets = this.continueTargets.map((t) => `${t.targetSeatId} (flow ${t.flowMode})`).join(", ");
+      this.log(`Seat ${this.seatId} relays to ${targets}.`);
     }
     this.log("Run `muuuuse status` or `muuuuse stop` from any terminal.");
 
@@ -1641,8 +1334,6 @@ function buildSeatReport(sessionName, seatId) {
   return {
     seatId,
     state: wrapperLive ? status?.state || "running" : "orphaned_child",
-    flowMode: status?.flowMode || meta?.flowMode || "off",
-    continueSeatId: status?.continueSeatId || meta?.continueSeatId || null,
     continueTargets: status?.continueTargets || meta?.continueTargets || [],
     wrapperPid,
     childPid,
@@ -1657,7 +1348,6 @@ function buildSeatReport(sessionName, seatId) {
     trust: status?.trust || null,
     updatedAt: status?.updatedAt || null,
     lastAnswerAt: status?.lastAnswerAt || null,
-    partnerLive: Boolean(status?.partnerLive),
   };
 }
 
