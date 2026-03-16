@@ -40,7 +40,8 @@ const {
   writeJson,
 } = require("./util");
 
-const TYPE_CHUNK_DELAY_MS = 18;
+// A short settle delay keeps interactive CLIs from treating submit as another newline.
+const TYPE_CHUNK_DELAY_MS = 45;
 const TYPE_CHUNK_SIZE = 24;
 const MIRROR_SUPPRESSION_WINDOW_MS = 30 * 1000;
 const PENDING_RELAY_CONTEXT_TTL_MS = 2 * 60 * 1000;
@@ -89,6 +90,26 @@ function normalizeFlowMode(flowMode) {
 function normalizeContinueSeatId(value) {
   const seatId = normalizeSeatId(value);
   return seatId || null;
+}
+
+function normalizeContinueTargets(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => {
+      const seatId = normalizeSeatId(entry?.seatId);
+      if (!seatId) {
+        return null;
+      }
+
+      return {
+        seatId,
+        flowMode: normalizeFlowMode(entry?.flowMode),
+      };
+    })
+    .filter((entry) => entry !== null);
 }
 
 function resolveShell() {
@@ -170,8 +191,8 @@ function sleepSync(ms) {
 
 function findJoinableSessionName(currentPath = process.cwd(), seatId = 2) {
   const normalizedSeatId = normalizeSeatId(seatId);
-  const anchorSeatId = getPartnerSeatId(normalizedSeatId);
-  if (!normalizedSeatId || !anchorSeatId || isAnchorSeat(normalizedSeatId)) {
+  const partnerSeatId = getPartnerSeatId(normalizedSeatId);
+  if (!normalizedSeatId || !partnerSeatId) {
     return null;
   }
 
@@ -179,29 +200,29 @@ function findJoinableSessionName(currentPath = process.cwd(), seatId = 2) {
     .map((sessionName) => {
       const sessionPaths = getSessionPaths(sessionName);
       const controller = readJson(sessionPaths.controllerPath, null);
-      const anchorPaths = getSeatPaths(sessionName, anchorSeatId);
+      const partnerPaths = getSeatPaths(sessionName, partnerSeatId);
       const seatPaths = getSeatPaths(sessionName, normalizedSeatId);
-      const anchorMeta = readJson(anchorPaths.metaPath, null);
-      const anchorStatus = readJson(anchorPaths.statusPath, null);
+      const partnerMeta = readJson(partnerPaths.metaPath, null);
+      const partnerStatus = readJson(partnerPaths.statusPath, null);
       const seatMeta = readJson(seatPaths.metaPath, null);
       const seatStatus = readJson(seatPaths.statusPath, null);
       const stopRequest = readJson(sessionPaths.stopPath, null);
 
-      const cwd = controller?.cwd || anchorStatus?.cwd || anchorMeta?.cwd || seatStatus?.cwd || seatMeta?.cwd || null;
+      const cwd = controller?.cwd || partnerStatus?.cwd || partnerMeta?.cwd || seatStatus?.cwd || seatMeta?.cwd || null;
       if (!matchesWorkingPath(cwd, currentPath)) {
         return null;
       }
 
-      const anchorWrapperPid = anchorStatus?.pid || anchorMeta?.pid || null;
-      const anchorChildPid = anchorStatus?.childPid || anchorMeta?.childPid || null;
+      const partnerWrapperPid = partnerStatus?.pid || partnerMeta?.pid || null;
+      const partnerChildPid = partnerStatus?.childPid || partnerMeta?.childPid || null;
       const seatWrapperPid = seatStatus?.pid || seatMeta?.pid || null;
       const seatChildPid = seatStatus?.childPid || seatMeta?.childPid || null;
-      const anchorLive = isPidAlive(anchorWrapperPid) || isPidAlive(anchorChildPid);
+      const partnerLive = isPidAlive(partnerWrapperPid) || isPidAlive(partnerChildPid);
       const seatLive = isPidAlive(seatWrapperPid) || isPidAlive(seatChildPid);
       const stopRequestedAtMs = Date.parse(stopRequest?.requestedAt || "");
-      const createdAtMs = Date.parse(controller?.createdAt || anchorMeta?.startedAt || anchorStatus?.updatedAt || "");
+      const createdAtMs = Date.parse(controller?.createdAt || partnerMeta?.startedAt || partnerStatus?.updatedAt || "");
 
-      if (!anchorLive || seatLive) {
+      if (!partnerLive || seatLive) {
         return null;
       }
 
@@ -234,11 +255,16 @@ function waitForJoinableSessionName(currentPath = process.cwd(), seatId = 2, tim
 }
 
 function resolveSessionName(currentPath = process.cwd(), seatId = 1) {
-  if (isAnchorSeat(seatId)) {
-    return createSessionName(currentPath);
+  const joinableSessionName = findJoinableSessionName(currentPath, seatId);
+  if (joinableSessionName) {
+    return joinableSessionName;
   }
 
-  return waitForJoinableSessionName(currentPath, seatId);
+  if (!isAnchorSeat(seatId)) {
+    return waitForJoinableSessionName(currentPath, seatId) || createSessionName(currentPath);
+  }
+
+  return createSessionName(currentPath);
 }
 
 function parseAnswerEntries(text) {
@@ -472,17 +498,20 @@ function buildAnswerSignaturePayload(sessionName, challenge, entry) {
     origin: entry.origin,
     phase: entry.phase || "final_answer",
     createdAt: entry.createdAt,
+    targetSeatId: entry.targetSeatId || null,
+    targetFlowMode: normalizeFlowMode(entry.targetFlowMode),
     text: entry.text,
   });
 }
 
-function buildContinuationEntry(sourceSessionName, targetSeatId, entry) {
+function buildContinuationEntry(sourceSessionName, targetSeatId, entry, targetFlowMode = null) {
   return {
     id: createId(12),
     type: "continue",
     sourceSessionName,
     sourceSeatId: entry.seatId,
     targetSeatId,
+    targetFlowMode: normalizeFlowMode(targetFlowMode),
     origin: entry.origin || "unknown",
     phase: entry.phase || "final_answer",
     text: entry.text,
@@ -502,6 +531,15 @@ function getRelayPhase(entry) {
 
 function shouldAcceptInboundEntry(flowMode, entry) {
   return flowMode === "on" || getRelayPhase(entry) === "final_answer";
+}
+
+function resolveInboundFlowMode(defaultFlowMode, seatId, entry) {
+  const targetSeatId = normalizeSeatId(entry?.targetSeatId);
+  if (targetSeatId === normalizeSeatId(seatId)) {
+    return normalizeFlowMode(entry?.targetFlowMode);
+  }
+
+  return normalizeFlowMode(defaultFlowMode);
 }
 
 function getSeatDirIfExists(sessionName, seatId) {
@@ -614,9 +652,13 @@ class ArmedSeat {
     this.anchorSeatId = isAnchorSeat(options.seatId) ? options.seatId : this.partnerSeatId;
     this.flowMode = normalizeFlowMode(options.flowMode);
     this.continueSeatId = normalizeContinueSeatId(options.continueSeatId);
+    this.continueTargets = normalizeContinueTargets(options.continueTargets);
     this.cwd = normalizeWorkingPath(options.cwd);
     if (this.continueSeatId === this.seatId) {
       throw new Error(`\`muuuuse ${this.seatId}\` cannot continue to itself.`);
+    }
+    if (this.continueTargets.some((target) => target.seatId === this.seatId)) {
+      throw new Error(`\`muuuuse ${this.seatId}\` cannot link to itself.`);
     }
     this.sessionName = resolveSessionName(this.cwd, this.seatId);
     if (!this.sessionName) {
@@ -692,6 +734,7 @@ class ArmedSeat {
       sessionName: this.sessionName,
       flowMode: this.flowMode,
       continueSeatId: this.continueSeatId,
+      continueTargets: this.continueTargets,
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
@@ -708,6 +751,7 @@ class ArmedSeat {
       sessionName: this.sessionName,
       flowMode: this.flowMode,
       continueSeatId: this.continueSeatId,
+      continueTargets: this.continueTargets,
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
@@ -1043,6 +1087,27 @@ class ArmedSeat {
     return Boolean(partner?.pid && isPidAlive(partner.pid));
   }
 
+  getLinkTarget(seatId) {
+    const desiredSeatId = normalizeContinueSeatId(seatId);
+    if (!desiredSeatId) {
+      return null;
+    }
+
+    return this.continueTargets.find((target) => target.seatId === desiredSeatId) || null;
+  }
+
+  getPartnerLinkTarget() {
+    return this.getLinkTarget(this.partnerSeatId);
+  }
+
+  shouldCaptureCommentary() {
+    if (this.flowMode === "on") {
+      return true;
+    }
+
+    return this.continueTargets.some((target) => target.flowMode === "on");
+  }
+
   stopRequested() {
     const request = readJson(this.sessionPaths.stopPath, null);
     if (!request?.requestedAt) {
@@ -1053,18 +1118,19 @@ class ArmedSeat {
     return Number.isFinite(requestedAtMs) && requestedAtMs > this.startedAtMs;
   }
 
-  findContinuationTarget() {
-    if (!this.continueSeatId) {
+  findContinuationTarget(targetSeatId = null) {
+    const desiredSeatId = normalizeContinueSeatId(targetSeatId);
+    if (!desiredSeatId) {
       return null;
     }
 
     const candidates = listSessionNames()
       .map((sessionName) => {
-        if (!getSeatDirIfExists(sessionName, this.continueSeatId)) {
+        if (!getSeatDirIfExists(sessionName, desiredSeatId)) {
           return null;
         }
 
-        const seat = buildSeatReport(sessionName, this.continueSeatId);
+        const seat = buildSeatReport(sessionName, desiredSeatId);
         if (!seat || !matchesWorkingPath(seat.cwd, this.cwd)) {
           return null;
         }
@@ -1105,7 +1171,7 @@ class ArmedSeat {
         return;
       }
 
-      if (!shouldAcceptInboundEntry(this.flowMode, entry)) {
+      if (!shouldAcceptInboundEntry(resolveInboundFlowMode(this.flowMode, this.seatId, entry), entry)) {
         continue;
       }
 
@@ -1172,7 +1238,7 @@ class ArmedSeat {
         return;
       }
 
-      if (!shouldAcceptInboundEntry(this.flowMode, entry)) {
+      if (!shouldAcceptInboundEntry(resolveInboundFlowMode(this.flowMode, this.seatId, entry), entry)) {
         continue;
       }
 
@@ -1389,7 +1455,7 @@ class ArmedSeat {
         this.liveState.sessionFile,
         this.liveState.offset,
         this.liveState.captureSinceMs,
-        { flowMode: this.flowMode === "on" }
+        { flowMode: this.shouldCaptureCommentary() }
       );
       this.liveState.offset = result.nextOffset;
       answers.push(...result.answers);
@@ -1398,7 +1464,7 @@ class ArmedSeat {
         this.liveState.sessionFile,
         this.liveState.offset,
         this.liveState.captureSinceMs,
-        { flowMode: this.flowMode === "on" }
+        { flowMode: this.shouldCaptureCommentary() }
       );
       this.liveState.offset = result.nextOffset;
       answers.push(...result.answers);
@@ -1407,7 +1473,7 @@ class ArmedSeat {
         this.liveState.sessionFile,
         this.liveState.lastMessageId,
         this.liveState.captureSinceMs,
-        { flowMode: this.flowMode === "on" }
+        { flowMode: this.shouldCaptureCommentary() }
       );
       this.liveState.lastMessageId = result.lastMessageId;
       this.liveState.offset = result.fileSize;
@@ -1440,7 +1506,7 @@ class ArmedSeat {
     }
 
     const payload = sanitizeRelayText(entry.text);
-    if (!payload || !this.identity || !this.trustState.challenge) {
+    if (!payload) {
       return;
     }
 
@@ -1459,7 +1525,7 @@ class ArmedSeat {
     const pendingInboundContext = this.getPendingInboundContext();
 
     const entryId = entry.id || createId(12);
-    const signedEntry = {
+    const relayEntry = {
       id: entryId,
       type: "answer",
       seatId: this.seatId,
@@ -1469,34 +1535,70 @@ class ArmedSeat {
       createdAt: entry.createdAt || new Date().toISOString(),
       chainId: pendingInboundContext?.chainId || entry.chainId || entryId,
       hop: pendingInboundContext ? pendingInboundContext.hop + 1 : 0,
-      challenge: this.trustState.challenge,
-      publicKey: this.identity.publicKey,
     };
-    signedEntry.signature = signText(
-      buildAnswerSignaturePayload(this.sessionName, this.trustState.challenge, signedEntry),
-      this.identity.privateKey
-    );
-    appendJsonl(this.paths.eventsPath, signedEntry);
-    this.forwardContinuation(signedEntry);
+
+    const partnerLinkTarget = this.getPartnerLinkTarget();
+    let outboundEntry = relayEntry;
+    if (this.isPaired() && this.identity) {
+      const signedEntry = {
+        ...relayEntry,
+        challenge: this.trustState.challenge,
+        publicKey: this.identity.publicKey,
+        targetSeatId: partnerLinkTarget?.seatId || null,
+        targetFlowMode: partnerLinkTarget?.flowMode || null,
+      };
+      signedEntry.signature = signText(
+        buildAnswerSignaturePayload(this.sessionName, this.trustState.challenge, signedEntry),
+        this.identity.privateKey
+      );
+
+      if (!partnerLinkTarget) {
+        appendJsonl(this.paths.eventsPath, signedEntry);
+      }
+      outboundEntry = signedEntry;
+    }
+
+    if (this.continueSeatId || this.continueTargets.length > 0) {
+      this.forwardContinuation(outboundEntry);
+    }
     this.rememberEmittedAnswer(answerKey);
 
     this.log(`[${this.seatId}] ${previewText(payload)}`);
   }
 
   forwardContinuation(signedEntry) {
-    if (!this.continueSeatId) {
+    const targets = [...this.continueTargets];
+    if (this.continueSeatId && !targets.some((target) => target.seatId === this.continueSeatId)) {
+      targets.push({
+        seatId: this.continueSeatId,
+        flowMode: null,
+      });
+    }
+
+    if (targets.length === 0) {
       return;
     }
 
-    const target = this.findContinuationTarget();
-    if (!target) {
-      this.log(`[${this.seatId}] continue ${this.continueSeatId} unavailable`);
-      return;
-    }
+    for (const targetEntry of targets) {
+      if (targetEntry.flowMode && !shouldAcceptInboundEntry(targetEntry.flowMode, signedEntry)) {
+        continue;
+      }
 
-    const continuationEntry = buildContinuationEntry(this.sessionName, target.seatId, signedEntry);
-    appendJsonl(target.paths.continuePath, continuationEntry);
-    this.log(`[${this.seatId} => ${target.seatId}] ${previewText(continuationEntry.text)}`);
+      const target = this.findContinuationTarget(targetEntry.seatId);
+      if (!target) {
+        this.log(`[${this.seatId}] continue ${targetEntry.seatId} unavailable`);
+        continue;
+      }
+
+      const continuationEntry = buildContinuationEntry(
+        this.sessionName,
+        target.seatId,
+        signedEntry,
+        targetEntry.flowMode
+      );
+      appendJsonl(target.paths.continuePath, continuationEntry);
+      this.log(`[${this.seatId} => ${target.seatId}] ${previewText(continuationEntry.text)}`);
+    }
   }
 
   async tick() {
@@ -1548,10 +1650,19 @@ class ArmedSeat {
     if (this.continueSeatId) {
       this.log(`Seat ${this.seatId} continues to seat ${this.continueSeatId}.`);
     }
-    if (isAnchorSeat(this.seatId)) {
-      this.log(`Seat ${this.seatId} generated the session key and is waiting for seat ${this.partnerSeatId} to sign it.`);
+    if (this.continueTargets.length > 0) {
+      this.log(
+        `Seat ${this.seatId} links additional targets: ${this.continueTargets.map((target) => `${target.seatId}:${target.flowMode}`).join(", ")}.`
+      );
+    }
+    if (this.partnerIsLive()) {
+      if (isAnchorSeat(this.seatId)) {
+        this.log(`Seat ${this.seatId} generated the session key and is waiting for seat ${this.partnerSeatId} to sign it.`);
+      } else {
+        this.log(`Seat ${this.seatId} will sign the session key from seat ${this.partnerSeatId}, then relay goes live.`);
+      }
     } else {
-      this.log(`Seat ${this.seatId} will sign the session key from seat ${this.partnerSeatId}, then relay goes live.`);
+      this.log(`Seat ${this.seatId} is armed without a live pair partner. Link targets can relay immediately; direct pair relay activates after seat ${this.partnerSeatId} joins.`);
     }
     this.log("Run `muuuuse status` or `muuuuse stop` from any terminal.");
 
@@ -1650,6 +1761,7 @@ function buildSeatReport(sessionName, seatId) {
     state: wrapperLive ? status?.state || "running" : "orphaned_child",
     flowMode: status?.flowMode || meta?.flowMode || "off",
     continueSeatId: status?.continueSeatId || meta?.continueSeatId || null,
+    continueTargets: normalizeContinueTargets(status?.continueTargets || meta?.continueTargets),
     wrapperPid,
     childPid,
     wrapperLive,
