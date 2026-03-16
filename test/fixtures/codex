@@ -1,2 +1,3 @@
 #!/usr/bin/env bash
-exec -a codex node /root/muuuuse/test/fixtures/noisy-codex.js "$@"
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec -a codex node "$script_dir/noisy-codex.js" "$@"
