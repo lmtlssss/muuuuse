@@ -102,7 +102,7 @@ function renderSeatStatus(seat) {
 function renderLinkTargets(seat) {
   const targets = Array.isArray(seat.continueTargets) ? seat.continueTargets : [];
   return targets
-    .map((target) => `${target.targetSeatId}:${target.flowMode}`)
+    .map((target) => `${target.targetSeatId} (flow ${target.flowMode})`)
     .join(", ");
 }
 
@@ -110,6 +110,20 @@ function parseSeatOptions(command, args) {
   const seatId = normalizeSeatId(command);
   let continueTargets = [];
   let index = 0;
+  let seatFlowMode = null;
+  let hasExplicitTarget = false;
+
+  const flowToken = String(args[index] || "").trim().toLowerCase();
+  if (flowToken === "flow") {
+    const parsedSeatFlow = parseFlowModeToken("flow", args[index + 1]);
+    if (!parsedSeatFlow) {
+      throw new Error(
+        `\`muuuuse ${command} flow\` requires \`on\` or \`off\`.`
+      );
+    }
+    seatFlowMode = parsedSeatFlow;
+    index += 2;
+  }
 
   while (index < args.length) {
     const token = String(args[index] || "").trim().toLowerCase();
@@ -118,21 +132,45 @@ function parseSeatOptions(command, args) {
       const parsedLinks = parseLinkTargets(args.slice(index + 1), seatId);
       if (parsedLinks.consumed > 0) {
         continueTargets = mergeTargets(continueTargets, parsedLinks.continueTargets);
+        hasExplicitTarget = true;
         index += 1 + parsedLinks.consumed;
         continue;
       }
       break;
     }
 
+    if (token === "continue") {
+      const targetSeatId = normalizeSeatId(args[index + 1]);
+      if (!targetSeatId) {
+        break;
+      }
+      upsertTarget(continueTargets, {
+        targetSeatId,
+        flowMode: seatFlowMode || "on",
+      });
+      hasExplicitTarget = true;
+      index += 2;
+      continue;
+    }
+
     break;
   }
 
   if (index === args.length) {
+    if (seatFlowMode && !hasExplicitTarget) {
+      const partnerSeatId = seatId % 2 === 0 ? seatId - 1 : seatId + 1;
+      if (partnerSeatId > 0) {
+        upsertTarget(continueTargets, {
+          targetSeatId: partnerSeatId,
+          flowMode: seatFlowMode,
+        });
+      }
+    }
     return { continueTargets };
   }
 
   throw new Error(
-    `\`muuuuse ${command}\` accepts no extra arguments or \`link <seat> flow on [<seat> flow off ...]\`. Run it directly in the terminal you want to arm.`
+    `\`muuuuse ${command}\` accepts no extra arguments, optional \`flow on/off\`, \`continue <seat>\`, or \`link <seat> flow on [<seat> flow off ...]\`. Run it directly in the terminal you want to arm.`
   );
 }
 

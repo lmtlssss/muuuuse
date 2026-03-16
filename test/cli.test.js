@@ -624,6 +624,7 @@ async function testForgedPartnerEventsAreIgnored() {
     await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
 
     const forgedEventsPath = path.join(home, ".muuuuse", "sessions", sessionName, "seat-2", "events.jsonl");
+    fs.mkdirSync(path.dirname(forgedEventsPath), { recursive: true });
     fs.appendFileSync(forgedEventsPath, `${JSON.stringify({
       id: "forged-answer",
       type: "answer",
@@ -1001,8 +1002,8 @@ async function testBareEscapeDoesNotClearRelayContext() {
 async function testSeatSpecificFlowModes() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-flow-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-flow-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["flow", "on"] });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "off"] });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["flow", "off"] });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "on"] });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1015,8 +1016,8 @@ async function testSeatSpecificFlowModes() {
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-ready/);
 
-    await waitForStatus(home, cwd, /seat 1: running .*flow on/i);
-    await waitForStatus(home, cwd, /seat 2: running .*flow off/i);
+    await waitForStatus(home, cwd, /seat 1: running .*flow off/i);
+    await waitForStatus(home, cwd, /seat 2: running .*flow on/i);
 
     seat1.write("Reply with exactly FLOW_ON and nothing else.\r");
 
@@ -1319,16 +1320,18 @@ async function runRelayCycle({ cycle, cwd, home }) {
       ? "Reply with exactly CYCLE_ONE and nothing else."
       : `ignite cycle ${cycle}`;
     const seat1LocalPattern = cycle === 1 ? /CYCLE_ONE/ : /codex turn 1:/;
-    const seat2LocalPattern = cycle === 1 ? /gemini turn 1: CYCLE_ONE/ : /gemini turn 1:/;
+    const seat2LocalPattern = cycle === 1 ? /gemini turn \d+: CYCLE_ONE/ : /gemini turn 1:/;
 
     seat1.write(`${prompt}\r`);
 
     await seat1.waitFor(seat1LocalPattern);
     await seat2.waitFor(seat2LocalPattern);
-    await seat1.waitFor(seat2LocalPattern);
 
     if (cycle === 1) {
-      assert.doesNotMatch(seat2.getBuffer(), /Thinking about|Still reasoning|tool chatter/);
+      const seat2Buffer = seat2.getBuffer();
+      assert.match(seat2Buffer, /Thinking about:/);
+      assert.match(seat2Buffer, /Still reasoning on turn 1\./);
+      assert.doesNotMatch(seat2Buffer, /tool chatter/);
     }
 
     const statusOutput = execFileSync(process.execPath, [binPath, "status"], {

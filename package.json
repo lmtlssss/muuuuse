@@ -1,7 +1,7 @@
 {
   "name": "muuuuse",
-  "version": "6.0.0",
-  "description": "🔌Muuuuse arms regular terminals in isolated pairs and can continue relay output into any other armed seat.",
+  "version": "7.0.0",
+  "description": "🔌Muuuuse relay protocol for long-horizon zero-drift agentic code loops. Any seat relays to any other with per-target signed trust and flow control.",
   "type": "commonjs",
   "bin": {
     "muuuuse": "bin/muuse.js"

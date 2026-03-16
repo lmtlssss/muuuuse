@@ -468,7 +468,9 @@ function parseCodexAssistantLine(line, options = {}) {
     }
 
     const phase = String(entry.payload?.phase || "").trim().toLowerCase();
-    const relayablePhase = phase === "final_answer" || (flowMode && phase === "commentary");
+    // Newer Codex sessions can omit `payload.phase` for final answers.
+    const normalizedPhase = phase === "commentary" ? "commentary" : "final_answer";
+    const relayablePhase = normalizedPhase === "final_answer" || (flowMode && normalizedPhase === "commentary");
     if (!relayablePhase) {
       return null;
     }
@@ -481,7 +483,7 @@ function parseCodexAssistantLine(line, options = {}) {
     return {
       id: entry.payload.id || hashText(line),
       text,
-      phase: phase === "commentary" ? "commentary" : "final_answer",
+      phase: normalizedPhase,
       timestamp: entry.timestamp || entry.payload.timestamp || new Date().toISOString(),
     };
   } catch {

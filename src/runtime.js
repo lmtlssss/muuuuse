@@ -58,11 +58,6 @@ function normalizeFlowMode(flowMode) {
   return String(flowMode || "").trim().toLowerCase() === "on" ? "on" : "off";
 }
 
-function normalizeContinueSeatId(value) {
-  const seatId = normalizeSeatId(value);
-  return seatId || null;
-}
-
 function resolveShell() {
   const shell = String(process.env.SHELL || "").trim();
   return shell || "/bin/bash";
@@ -132,6 +127,11 @@ function createSessionName(currentPath = process.cwd()) {
   return `${getDefaultSessionName(currentPath)}-${createId(6)}`;
 }
 
+function getAnchorSeatId(seatId = 1) {
+  const normalizedSeatId = normalizeSeatId(seatId) || 1;
+  return normalizedSeatId % 2 === 0 ? normalizedSeatId - 1 : normalizedSeatId;
+}
+
 function sleepSync(ms) {
   if (!Number.isFinite(ms) || ms <= 0) {
     return;
@@ -140,7 +140,8 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function findExistingSessionName(currentPath = process.cwd()) {
+function findExistingSessionName(currentPath = process.cwd(), anchorSeatId = null) {
+  const targetAnchorSeatId = normalizeSeatId(anchorSeatId) || null;
   const candidates = listSessionNames()
     .map((sessionName) => {
       const sessionPaths = getSessionPaths(sessionName);
@@ -158,6 +159,16 @@ function findExistingSessionName(currentPath = process.cwd()) {
         return null;
       }
 
+      if (targetAnchorSeatId) {
+        const controllerAnchorSeatId = normalizeSeatId(controller?.anchorSeatId);
+        if (controllerAnchorSeatId && controllerAnchorSeatId !== targetAnchorSeatId) {
+          return null;
+        }
+        if (!controllerAnchorSeatId && !getSeatDirIfExists(sessionName, targetAnchorSeatId)) {
+          return null;
+        }
+      }
+
       return {
         sessionName,
         createdAtMs,
@@ -169,10 +180,10 @@ function findExistingSessionName(currentPath = process.cwd()) {
   return candidates[0]?.sessionName || null;
 }
 
-function waitForExistingSessionName(currentPath = process.cwd(), timeoutMs = SEAT_JOIN_WAIT_MS) {
+function waitForExistingSessionName(currentPath = process.cwd(), timeoutMs = SEAT_JOIN_WAIT_MS, anchorSeatId = null) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
-    const sessionName = findExistingSessionName(currentPath);
+    const sessionName = findExistingSessionName(currentPath, anchorSeatId);
     if (sessionName) {
       return sessionName;
     }
@@ -183,9 +194,17 @@ function waitForExistingSessionName(currentPath = process.cwd(), timeoutMs = SEA
 }
 
 function resolveSessionName(currentPath = process.cwd(), seatId = 1) {
-  const existing = findExistingSessionName(currentPath);
+  const anchorSeatId = getAnchorSeatId(seatId);
+  const existing = findExistingSessionName(currentPath, anchorSeatId);
   if (existing) {
     return existing;
+  }
+
+  if (seatId % 2 === 0) {
+    const waited = waitForExistingSessionName(currentPath, SEAT_JOIN_WAIT_MS, anchorSeatId);
+    if (waited) {
+      return waited;
+    }
   }
 
   return createSessionName(currentPath);
@@ -540,26 +559,22 @@ async function sendTextAndEnter(child, text, shouldAbort = () => false) {
 class ArmedSeat {
   constructor(options) {
     this.seatId = options.seatId;
+    this.anchorSeatId = getAnchorSeatId(this.seatId);
+    this.partnerSeatId = this.seatId % 2 === 0 ? this.seatId - 1 : this.seatId + 1;
     this.continueTargets = Array.isArray(options.continueTargets) ? options.continueTargets : [];
     this.cwd = normalizeWorkingPath(options.cwd);
 
-    // Auto-link partner seat for backwards compatibility (seat 1→2, seat 2→1)
-    // This preserves v5 behavior where odd seats (anchor) initiate relay to even (partner)
+    // Auto-link adjacent partner seat for backwards compatibility (1↔2, 3↔4, ...).
     if (this.continueTargets.length === 0) {
-      if (this.seatId === 1) {
-        // Seat 1 (odd/anchor) relays to seat 2
-        this.continueTargets.push({ targetSeatId: 2, flowMode: "on" });
-      } else if (this.seatId === 3) {
-        // Seat 3 relays to seat 4
-        this.continueTargets.push({ targetSeatId: 4, flowMode: "on" });
+      if (this.partnerSeatId > 0) {
+        this.continueTargets.push({ targetSeatId: this.partnerSeatId, flowMode: "on" });
       }
-      // Even seats don't auto-link (they receive from odd partners)
     }
 
     if (this.continueTargets.some((t) => t.targetSeatId === this.seatId)) {
       throw new Error(`\`muuuuse ${this.seatId}\` cannot relay to itself.`);
     }
-    this.sessionName = resolveSessionName(this.cwd);
+    this.sessionName = resolveSessionName(this.cwd, this.seatId);
     if (!this.sessionName) {
       throw new Error(
         `Failed to create or find session in ${this.cwd}.`
@@ -568,7 +583,28 @@ class ArmedSeat {
     this.sessionPaths = getSessionPaths(this.sessionName);
     this.paths = getSeatPaths(this.sessionName, this.seatId);
     this.continueOffset = getFileSize(this.paths.continuePath);
-    this.relayTargets = {};
+
+    // Per-target trust state, paths, and event offsets for the signed relay channel.
+    // Only create directories for same-session targets (same anchor pair).
+    // Cross-session targets use the continuation channel and don't need local seat dirs.
+    const ownAnchor = getAnchorSeatId(this.seatId);
+    this.targetTrust = {};
+    this.targetPaths = {};
+    this.targetOffsets = {};
+    for (const t of this.continueTargets) {
+      const sameSession = getAnchorSeatId(t.targetSeatId) === ownAnchor;
+      this.targetTrust[t.targetSeatId] = {
+        challenge: null,
+        peerPublicKey: null,
+        phase: "initializing",
+        pairedAt: null,
+        sameSession,
+      };
+      this.targetPaths[t.targetSeatId] = sameSession
+        ? getSeatPaths(this.sessionName, t.targetSeatId)
+        : null;
+      this.targetOffsets[t.targetSeatId] = 0;
+    }
 
     this.child = null;
     this.childPid = null;
@@ -582,15 +618,11 @@ class ArmedSeat {
     this.resizeCleanup = null;
     this.forceKillTimer = null;
     this.identity = null;
+    this.ownChallenge = null;
     this.lastUserInputAtMs = 0;
     this.pendingInboundContext = null;
     this.recentInboundRelays = [];
     this.recentEmittedAnswers = [];
-    this.trustState = {
-      challenge: null,
-      phase: "initialized",
-      createdAt: null,
-    };
     this.liveState = {
       type: null,
       pid: null,
@@ -611,6 +643,8 @@ class ArmedSeat {
       cwd: this.cwd,
       createdAt: current.createdAt || this.startedAt,
       updatedAt: new Date().toISOString(),
+      anchorSeatId: this.anchorSeatId,
+      partnerSeatId: this.partnerSeatId,
       ...extra,
     });
   }
@@ -649,19 +683,84 @@ class ArmedSeat {
 
   initializeTrustMaterial() {
     this.identity = loadOrCreateSeatIdentity(this.paths);
+    const ownChallenge = createId(48);
     writeJson(this.paths.challengePath, {
       sessionName: this.sessionName,
+      challenge: ownChallenge,
       publicKey: this.identity.publicKey,
       createdAt: new Date().toISOString(),
     });
-    this.trustState.phase = "initialized";
-    this.trustState.createdAt = new Date().toISOString();
+    this.ownChallenge = ownChallenge;
   }
 
-  syncTrustState() {
+  syncTargetTrust() {
     if (!this.identity) {
       this.initializeTrustMaterial();
     }
+
+    for (const target of this.continueTargets) {
+      this.syncOneTargetTrust(target.targetSeatId);
+    }
+  }
+
+  syncOneTargetTrust(targetSeatId) {
+    const trust = this.targetTrust[targetSeatId];
+    if (!trust || trust.phase === "paired") {
+      return;
+    }
+
+    // Cross-session target: relay goes through the continuation channel only.
+    if (!trust.sameSession) {
+      trust.phase = "paired";
+      trust.pairedAt = new Date().toISOString();
+      return;
+    }
+
+    // Same-session target: read their challenge.json to get their public key
+    // and challenge. One-way trust — we just need to verify their events.
+    const targetPaths = this.targetPaths[targetSeatId];
+    if (!targetPaths) {
+      return;
+    }
+
+    const targetChallenge = readSeatChallenge(targetPaths, this.sessionName);
+    if (!targetChallenge) {
+      trust.phase = "waiting_for_target";
+      return;
+    }
+
+    trust.challenge = targetChallenge.challenge;
+    trust.peerPublicKey = targetChallenge.publicKey;
+    trust.phase = "paired";
+    trust.pairedAt = new Date().toISOString();
+
+    // Initialize offset to current file size so we only read new events.
+    this.targetOffsets[targetSeatId] = getFileSize(targetPaths.eventsPath);
+  }
+
+  isTargetPaired(targetSeatId) {
+    const trust = this.targetTrust[targetSeatId];
+    return Boolean(trust && trust.phase === "paired");
+  }
+
+  getOverallTrustPhase() {
+    const targets = this.continueTargets;
+    if (targets.length === 0) {
+      return "paired";
+    }
+    const allPaired = targets.every((t) => this.isTargetPaired(t.targetSeatId));
+    if (allPaired) {
+      return "paired";
+    }
+    const anyPaired = targets.some((t) => this.isTargetPaired(t.targetSeatId));
+    if (anyPaired) {
+      return "partial";
+    }
+    return "initializing";
+  }
+
+  hasAnyPairedTarget() {
+    return this.continueTargets.some((t) => this.isTargetPaired(t.targetSeatId));
   }
 
   launchShell() {
@@ -669,6 +768,7 @@ class ArmedSeat {
     fs.rmSync(this.paths.pipePath, { force: true });
     clearStaleStopRequest(this.sessionPaths.stopPath, this.startedAtMs);
     this.initializeTrustMaterial();
+    this.syncTargetTrust();
     this.writeController();
 
     const shell = resolveShell();
@@ -684,7 +784,7 @@ class ArmedSeat {
 
     this.childPid = this.child.pid;
     this.writeMeta();
-    this.writeStatus({ state: "running", trust: this.trustState.phase });
+    this.writeStatus({ state: "running", trust: this.getOverallTrustPhase() });
 
     this.child.onData((data) => {
       fs.appendFileSync(this.paths.pipePath, data);
@@ -1145,7 +1245,11 @@ class ArmedSeat {
     }
 
     const payload = sanitizeRelayText(entry.text);
-    if (!payload || !this.identity || !this.trustState.challenge) {
+    if (!payload || !this.identity || !this.ownChallenge) {
+      return;
+    }
+
+    if (!this.hasAnyPairedTarget()) {
       return;
     }
 
@@ -1162,8 +1266,10 @@ class ArmedSeat {
     }
 
     const pendingInboundContext = this.getPendingInboundContext();
-
     const entryId = entry.id || createId(12);
+
+    // Sign with OUR OWN challenge. Each reader verifies using our challenge
+    // (which they obtained during the trust handshake as peerChallenge).
     const signedEntry = {
       id: entryId,
       type: "answer",
@@ -1174,51 +1280,67 @@ class ArmedSeat {
       createdAt: entry.createdAt || new Date().toISOString(),
       chainId: pendingInboundContext?.chainId || entry.chainId || entryId,
       hop: pendingInboundContext ? pendingInboundContext.hop + 1 : 0,
-      challenge: this.trustState.challenge,
+      challenge: this.ownChallenge,
       publicKey: this.identity.publicKey,
     };
     signedEntry.signature = signText(
-      buildAnswerSignaturePayload(this.sessionName, this.trustState.challenge, signedEntry),
+      buildAnswerSignaturePayload(this.sessionName, this.ownChallenge, signedEntry),
       this.identity.privateKey
     );
     appendJsonl(this.paths.eventsPath, signedEntry);
-    this.forwardContinuation(signedEntry);
-    this.rememberEmittedAnswer(answerKey);
 
+    // Forward via continuation channel for cross-session targets.
+    for (const target of this.continueTargets) {
+      this.forwardContinuation(signedEntry, target);
+    }
+
+    this.rememberEmittedAnswer(answerKey);
     this.log(`[${this.seatId}] ${previewText(payload)}`);
   }
 
-  forwardContinuation(signedEntry) {
-    // Route to all continueTargets with per-target flow modes
-    for (const targetEntry of this.continueTargets) {
-      // Skip entries that don't match the target's flowMode
-      if (!shouldAcceptInboundEntry(targetEntry.flowMode, signedEntry)) {
-        continue;
-      }
-
-      const target = this.findContinuationTarget(targetEntry.targetSeatId);
-      if (!target) {
-        this.log(`[${this.seatId}] target ${targetEntry.targetSeatId} unavailable`);
-        continue;
-      }
-
-      const continuationEntry = buildContinuationEntry(this.sessionName, target.seatId, signedEntry);
-      appendJsonl(target.paths.continuePath, continuationEntry);
-      this.log(`[${this.seatId} => ${target.seatId} (${targetEntry.flowMode})] ${previewText(continuationEntry.text)}`);
+  forwardContinuation(signedEntry, targetEntry) {
+    if (!shouldAcceptInboundEntry(targetEntry.flowMode, signedEntry)) {
+      return;
     }
+
+    // Same-session target: write directly to their continuation channel.
+    const trust = this.targetTrust[targetEntry.targetSeatId];
+    if (trust && trust.sameSession) {
+      const targetPaths = this.targetPaths[targetEntry.targetSeatId];
+      if (targetPaths) {
+        const continuationEntry = buildContinuationEntry(this.sessionName, targetEntry.targetSeatId, signedEntry);
+        appendJsonl(targetPaths.continuePath, continuationEntry);
+        this.log(`[${this.seatId} => ${targetEntry.targetSeatId} (${targetEntry.flowMode})] ${previewText(continuationEntry.text)}`);
+      }
+      return;
+    }
+
+    // Cross-session target: find the target across sessions.
+    const target = this.findContinuationTarget(targetEntry.targetSeatId);
+    if (!target) {
+      return;
+    }
+
+    const continuationEntry = buildContinuationEntry(this.sessionName, target.seatId, signedEntry);
+    appendJsonl(target.paths.continuePath, continuationEntry);
+    this.log(`[${this.seatId} => ${target.seatId} (${targetEntry.flowMode})] ${previewText(continuationEntry.text)}`);
   }
 
   async tick() {
     if (this.stopRequested()) {
       this.writeStatus({
         state: "stopping",
-        trust: this.trustState.phase,
+        trust: this.getOverallTrustPhase(),
       });
       this.requestStop("stop_requested");
       return;
     }
 
-    this.syncTrustState();
+    this.syncTargetTrust();
+    if (this.stopped || this.stopRequested()) {
+      this.requestStop("stop_requested");
+      return;
+    }
     await this.pullContinuationEvents();
     if (this.stopped || this.stopRequested()) {
       this.requestStop("stop_requested");
@@ -1236,8 +1358,8 @@ class ArmedSeat {
       cwd: live.cwd,
       log: live.log,
       lastAnswerAt: live.lastAnswerAt,
-      trust: this.trustState.phase,
-      challengeReady: Boolean(this.trustState.challenge),
+      trust: this.getOverallTrustPhase(),
+      challengeReady: this.hasAnyPairedTarget(),
     });
   }
 
@@ -1251,7 +1373,7 @@ class ArmedSeat {
     this.log("Use this shell normally. Codex, Claude, and Gemini relay automatically from their local session logs.");
     if (this.continueTargets.length > 0) {
       const targets = this.continueTargets.map((t) => `${t.targetSeatId} (flow ${t.flowMode})`).join(", ");
-      this.log(`Seat ${this.seatId} relays to ${targets}.`);
+      this.log(`Seat ${this.seatId} relays to ${targets}. Establishing trust.`);
     }
     this.log("Run `muuuuse status` or `muuuuse stop` from any terminal.");
 
