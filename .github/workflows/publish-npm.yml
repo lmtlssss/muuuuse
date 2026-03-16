@@ -15,6 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
 
     steps:
       - name: Checkout
@@ -28,7 +29,7 @@ jobs:
           cache: npm
 
       - name: Test package
-        run: npm install && npm test
+        run: npm ci && npm test
 
       - name: Check whether version is already published
         id: npm_version
@@ -44,7 +45,6 @@ jobs:
           fi
 
       - name: Ensure NPM token is configured
-        if: steps.npm_version.outputs.published == 'false'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -59,6 +59,15 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
 
-      - name: Report skip
-        if: steps.npm_version.outputs.published == 'true'
-        run: echo "${{ steps.npm_version.outputs.name }}@${{ steps.npm_version.outputs.version }} is already published; skipping."
+      - name: Reconcile npm latest and deprecation state
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PACKAGE_REF="${{ steps.npm_version.outputs.name }}@${{ steps.npm_version.outputs.version }}"
+          npm dist-tag add "$PACKAGE_REF" latest
+          npm deprecate "$PACKAGE_REF" ""
+
+      - name: Report npm target
+        run: |
+          echo "npm target: ${{ steps.npm_version.outputs.name }}@${{ steps.npm_version.outputs.version }}"
+          npm view "${{ steps.npm_version.outputs.name }}" version dist-tags deprecated --json
