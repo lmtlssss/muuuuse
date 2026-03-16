@@ -1,4 +1,4 @@
-const { BRAND, normalizeSeatId, usage } = require("./util");
+const { BRAND, getPartnerSeatId, normalizeSeatId, usage } = require("./util");
 const { ArmedSeat, getStatusReport, stopAllSessions } = require("./runtime");
 
 async function main(argv = process.argv.slice(2)) {
@@ -56,10 +56,11 @@ async function main(argv = process.argv.slice(2)) {
 
   const seatId = normalizeSeatId(command);
   if (seatId) {
-    const { flowMode, continueSeatId } = parseSeatOptions(command, argv.slice(1));
+    const { flowMode, continueSeatId, continueTargets } = parseSeatOptions(command, argv.slice(1));
     const seat = new ArmedSeat({
       cwd: process.cwd(),
       continueSeatId,
+      continueTargets,
       flowMode,
       seatId,
     });
@@ -86,6 +87,9 @@ function renderSeatStatus(seat) {
   if (seat.continueSeatId) {
     bits.push(`continue ${seat.continueSeatId}`);
   }
+  if (Array.isArray(seat.continueTargets) && seat.continueTargets.length > 0) {
+    bits.push(`links ${renderLinkTargets(seat.continueTargets)}`);
+  }
   if (seat.trust) {
     bits.push(`trust ${seat.trust}`);
   }
@@ -103,17 +107,27 @@ function renderSeatStatus(seat) {
   return output;
 }
 
+function renderLinkTargets(targets) {
+  return targets
+    .map((target) => `${target.seatId}:${target.flowMode}`)
+    .join(", ");
+}
+
 function parseSeatOptions(command, args) {
+  const seatId = normalizeSeatId(command);
+  const partnerSeatId = getPartnerSeatId(seatId);
   let flowMode = "off";
   let continueSeatId = null;
+  let continueTargets = [];
+  let index = 0;
 
-  for (let index = 0; index < args.length;) {
+  for (; index < args.length;) {
     const token = String(args[index] || "").trim().toLowerCase();
 
     if (token === "flow") {
-      const flowToken = String(args[index + 1] || "").trim().toLowerCase();
-      if (flowToken === "on" || flowToken === "off") {
-        flowMode = flowToken;
+      const nextFlowMode = parseFlowModeToken(args[index + 1]);
+      if (nextFlowMode) {
+        flowMode = nextFlowMode;
         index += 2;
         continue;
       }
@@ -122,7 +136,7 @@ function parseSeatOptions(command, args) {
 
     if (token === "continue") {
       const targetSeatId = normalizeSeatId(args[index + 1]);
-      if (targetSeatId) {
+      if (targetSeatId && targetSeatId !== seatId) {
         continueSeatId = targetSeatId;
         index += 2;
         continue;
@@ -130,28 +144,94 @@ function parseSeatOptions(command, args) {
       break;
     }
 
+    if (token === "link") {
+      const parsed = parseLinkTargets(seatId, partnerSeatId, args, index + 1);
+      if (!parsed) {
+        break;
+      }
+
+      continueTargets = mergeTargets(continueTargets, parsed.continueTargets);
+      index = parsed.nextIndex;
+      continue;
+    }
+
     break;
   }
 
-  if (args.length === 0 || (flowMode || continueSeatId !== null) && consumedAllArgs(args, flowMode, continueSeatId)) {
-    return { flowMode, continueSeatId };
+  if (index === args.length) {
+    return { flowMode, continueSeatId, continueTargets };
   }
 
   throw new Error(
-    `\`muuuuse ${command}\` accepts no extra arguments, \`flow on\` / \`flow off\`, optional \`continue <seat>\`, or both in sequence. Run it directly in the terminal you want to arm.`
+    `\`muuuuse ${command}\` accepts \`flow on\` / \`flow off\`, optional \`continue <seat>\`, and optional \`link <seat> flow on|off ...\` groups. Run it directly in the terminal you want to arm.`
   );
 }
 
-function consumedAllArgs(args, flowMode, continueSeatId) {
-  const expected = [];
-  if (flowMode !== "off" || args.includes("flow")) {
-    expected.push("flow", flowMode);
+function mergeTargets(currentTargets, nextTargets) {
+  const merged = [...currentTargets];
+  for (const target of nextTargets) {
+    const currentIndex = merged.findIndex((entry) => entry.seatId === target.seatId);
+    if (currentIndex !== -1) {
+      merged.splice(currentIndex, 1);
+    }
+    merged.push(target);
   }
-  if (continueSeatId !== null || args.includes("continue")) {
-    expected.push("continue", String(continueSeatId));
+  return merged;
+}
+
+function parseLinkTargets(seatId, partnerSeatId, args, startIndex) {
+  let index = startIndex;
+  const continueTargets = [];
+
+  while (index < args.length) {
+    const targetSeatId = normalizeSeatId(args[index]);
+    if (!targetSeatId || targetSeatId === seatId) {
+      break;
+    }
+
+    if (String(args[index + 1] || "").trim().toLowerCase() !== "flow") {
+      break;
+    }
+
+    const targetFlowMode = parseFlowModeToken(args[index + 2]);
+    if (!targetFlowMode) {
+      break;
+    }
+
+    upsertTarget(continueTargets, {
+      seatId: targetSeatId,
+      flowMode: targetFlowMode,
+    });
+
+    index += 3;
   }
-  return expected.length === args.length &&
-    expected.every((value, index) => String(args[index]).trim().toLowerCase() === String(value).trim().toLowerCase());
+
+  if (index === startIndex) {
+    return null;
+  }
+
+  return {
+    continueTargets,
+    nextIndex: index,
+  };
+}
+
+function parseFlowModeToken(value) {
+  const token = String(value || "").trim().toLowerCase();
+  if (token === "on" || token === "off") {
+    return token;
+  }
+  return null;
+}
+
+function upsertTarget(targets, nextTarget) {
+  const currentIndex = targets.findIndex((target) => target.seatId === nextTarget.seatId);
+  if (currentIndex === -1) {
+    targets.push(nextTarget);
+    return;
+  }
+
+  targets[currentIndex] = nextTarget;
 }
 
 module.exports = {

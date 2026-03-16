@@ -30,6 +30,7 @@ const binPath = path.join(__dirname, "..", "bin", "muuse.js");
 const fixturePath = path.join(__dirname, "fixtures", "mock-agent.js");
 const noisyCodexPath = path.join(__dirname, "fixtures", "codex");
 const bellLoopPath = path.join(__dirname, "fixtures", "bell-loop.js");
+const geminiSubmitReceiverPath = path.join(__dirname, "fixtures", "gemini-submit-receiver.js");
 
 async function main() {
   testUsage();
@@ -61,8 +62,14 @@ async function main() {
   await testBareEscapeDoesNotClearRelayContext();
   await testSeatSpecificFlowModes();
   await testAdditionalPairsStaySeparate();
+  await testEvenSeatCanStartBeforeOddSeat();
   await testContinuationTargetsChainAcrossPairs();
   await testFlowOffContinuationSuppressesCommentary();
+  await testStandaloneLinksRouteWithoutPairDependency();
+  await testDirectionalPartnerLinksOverrideReceiverFlow();
+  await testDirectionalPartnerLinksSuppressReverseCommentary();
+  await testLinkSyntaxFansOutAcrossTargets();
+  await testGeminiReceiverNeedsCrSubmit();
   await testStopSilencesBellLoop();
   process.stdout.write("muuuuse tests passed\n");
 }
@@ -79,6 +86,7 @@ function testUsage() {
   assert.match(output, /muuuuse 4/);
   assert.match(output, /continue 3/);
   assert.match(output, /continue 1/);
+  assert.match(output, /link 2 flow on 3 flow off 5 flow off/);
   assert.match(output, /muuuuse status/);
   assert.match(output, /muuuuse stop/);
 }
@@ -90,7 +98,7 @@ function testRejectsExtraArgs() {
       stdio: "pipe",
       env: process.env,
     });
-  }, /accepts no extra arguments, `flow on` \/ `flow off`, optional `continue <seat>`, or both in sequence/i);
+  }, /accepts `flow on` \/ `flow off`, optional `continue <seat>`, and optional `link <seat> flow on\|off/i);
 }
 
 function testCodexParsing() {
@@ -1107,6 +1115,41 @@ async function testAdditionalPairsStaySeparate() {
   }
 }
 
+async function testEvenSeatCanStartBeforeOddSeat() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-even-first-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-even-first-cwd-"));
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "on"] });
+  let seat1 = null;
+
+  try {
+    await seat2.waitFor(/seat 2 armed/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust waiting_for_anchor_key/i);
+
+    seat1 = spawnSeat(1, { cwd, home, extraArgs: ["flow", "on"] });
+    await seat1.waitFor(/seat 1 armed/i);
+
+    seat1.write(`${shellQuote(noisyCodexPath)}\r`);
+    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-submit-ready/);
+    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
+
+    seat1.write("Reply with exactly EVEN_FIRST\r");
+
+    await seat2.waitFor(/submitted:Thinking about: Reply with exactly EVEN_FIRST/);
+    await seat2.waitFor(/submitted:Still reasoning on turn 1\./);
+    await seat2.waitFor(/submitted:EVEN_FIRST/);
+  } finally {
+    await forceStop(home, cwd);
+    if (seat1) {
+      seat1.dispose();
+    }
+    seat2.dispose();
+  }
+}
+
 async function testContinuationTargetsChainAcrossPairs() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-cwd-"));
@@ -1246,6 +1289,185 @@ async function testFlowOffContinuationSuppressesCommentary() {
     seat2.dispose();
     seat3.dispose();
     seat4.dispose();
+  }
+}
+
+async function testStandaloneLinksRouteWithoutPairDependency() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-standalone-link-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-standalone-link-cwd-"));
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["link", "3", "flow", "off"] });
+  const seat3 = spawnSeat(3, { cwd, home });
+
+  try {
+    await seat2.waitFor(/seat 2 armed/i);
+    await seat3.waitFor(/seat 3 armed/i);
+
+    seat2.write(`MOCK_REPLY_TEXT=SOLO_ROUTE ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat3.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+
+    await seat2.waitFor(/codex-ready/);
+    await seat3.waitFor(/gemini-submit-ready/);
+    await waitForStatus(home, cwd, /seat 2: running .*links 3:off/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust waiting_for_anchor_key/i);
+    await waitForStatus(home, cwd, /seat 3: running .*trust waiting_for_peer_signature/i);
+
+    seat2.write("ignite\r");
+
+    await seat2.waitFor(/\bSOLO_ROUTE\b/);
+    await seat3.waitFor(/submitted:SOLO_ROUTE/);
+  } finally {
+    await forceStop(home, cwd);
+    seat2.dispose();
+    seat3.dispose();
+  }
+}
+
+async function testDirectionalPartnerLinksOverrideReceiverFlow() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-partner-link-on-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-partner-link-on-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["link", "2", "flow", "on"] });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["link", "1", "flow", "off"] });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+
+    seat1.write(`${shellQuote(noisyCodexPath)}\r`);
+    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-submit-ready/);
+    await waitForStatus(home, cwd, /seat 1: running .*flow off.*links 2:on.*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*flow off.*links 1:off.*trust paired/i);
+
+    seat1.write("Reply with exactly PARTNER_LINK_ON\r");
+
+    await seat2.waitFor(/submitted:Thinking about: Reply with exactly PARTNER_LINK_ON/);
+    await seat2.waitFor(/submitted:Still reasoning on turn 1\./);
+    await seat2.waitFor(/submitted:PARTNER_LINK_ON/);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
+}
+
+async function testDirectionalPartnerLinksSuppressReverseCommentary() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-partner-link-off-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-partner-link-off-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["link", "2", "flow", "on"] });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["link", "1", "flow", "off"] });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+
+    seat1.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+    seat2.write(`${shellQuote(noisyCodexPath)}\r`);
+
+    await seat1.waitFor(/gemini-submit-ready/);
+    await seat2.waitFor(/codex-ready/);
+    await waitForStatus(home, cwd, /seat 1: running .*flow off.*links 2:on.*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*flow off.*links 1:off.*trust paired/i);
+
+    seat2.write("Reply with exactly PARTNER_LINK_OFF\r");
+
+    await seat1.waitFor(/submitted:PARTNER_LINK_OFF/);
+    await sleep(1200);
+
+    const seat1Buffer = seat1.getBuffer();
+    assert.doesNotMatch(seat1Buffer, /Thinking about:/);
+    assert.doesNotMatch(seat1Buffer, /Still reasoning on turn 1\./);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
+}
+
+async function testLinkSyntaxFansOutAcrossTargets() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-link-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-link-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["link", "2", "flow", "on", "3", "flow", "off", "5", "flow", "off"] });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "on"] });
+  const seat3 = spawnSeat(3, { cwd, home });
+  const seat4 = spawnSeat(4, { cwd, home });
+  const seat5 = spawnSeat(5, { cwd, home });
+  const seat6 = spawnSeat(6, { cwd, home });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    await seat3.waitFor(/seat 3 armed/i);
+    await seat4.waitFor(/seat 4 armed/i);
+    await seat5.waitFor(/seat 5 armed/i);
+    await seat6.waitFor(/seat 6 armed/i);
+
+    seat1.write(`${shellQuote(noisyCodexPath)}\r`);
+    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+    seat3.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+    seat5.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-submit-ready/);
+    await seat3.waitFor(/gemini-submit-ready/);
+    await seat5.waitFor(/gemini-submit-ready/);
+
+    await waitForStatus(home, cwd, /seat 1: running .*flow off.*links 2:on, 3:off, 5:off/i);
+    await waitForStatus(home, cwd, /seat 2: running .*flow on.*trust paired/i);
+
+    seat1.write("Reply with exactly ROUTE_ONE\r");
+
+    await seat2.waitFor(/submitted:Thinking about: Reply with exactly ROUTE_ONE/);
+    await seat2.waitFor(/submitted:Still reasoning on turn 1\./);
+    await seat2.waitFor(/submitted:ROUTE_ONE/);
+    await seat3.waitFor(/submitted:ROUTE_ONE/);
+    await seat5.waitFor(/submitted:ROUTE_ONE/);
+    await sleep(1200);
+
+    const seat3Buffer = seat3.getBuffer();
+    const seat5Buffer = seat5.getBuffer();
+    assert.doesNotMatch(seat3Buffer, /Thinking about:/);
+    assert.doesNotMatch(seat3Buffer, /Still reasoning on turn 1\./);
+    assert.doesNotMatch(seat5Buffer, /Thinking about:/);
+    assert.doesNotMatch(seat5Buffer, /Still reasoning on turn 1\./);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+    seat3.dispose();
+    seat4.dispose();
+    seat5.dispose();
+    seat6.dispose();
+  }
+}
+
+async function testGeminiReceiverNeedsCrSubmit() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-submit-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-submit-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home });
+  const seat2 = spawnSeat(2, { cwd, home });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+
+    seat1.write(`MOCK_REPLY_TEXT=SEND_ME ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-submit-ready/);
+    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
+
+    seat1.write("ignite\r");
+
+    await seat1.waitFor(/SEND_ME/);
+    await seat2.waitFor(/submitted:SEND_ME/);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
   }
 }
 
