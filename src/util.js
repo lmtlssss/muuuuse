@@ -9,7 +9,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const BRAND = "🔌Muuuuse v7.0.0";
+const BRAND = "🔌Muuuuse v7.0.1";
 const POLL_MS = 220;
 const MAX_RELAY_CHARS = 4000;
 const SESSION_MATCH_WINDOW_MS = 5 * 60 * 1000;

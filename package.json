@@ -1,6 +1,6 @@
 {
   "name": "muuuuse",
-  "version": "7.0.0",
+  "version": "7.0.1",
   "description": "🔌Muuuuse relay protocol for long-horizon zero-drift agentic code loops. Any seat relays to any other with per-target signed trust and flow control.",
   "type": "commonjs",
   "bin": {
