@@ -599,7 +599,7 @@ async function sendTextAndEnter(child, text, shouldAbort = () => false) {
   }
 
   try {
-    child.write("\r");
+    child.write("\n");
   } catch {
     return false;
   }
