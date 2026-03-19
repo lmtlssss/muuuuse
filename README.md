@@ -45,7 +45,7 @@ Terminal 2:
 muuuuse 2 link 1 flow off link 3 flow on link 4 flow on
 ```
 
-Now both shells are armed in the same cwd and join the same relay graph. Every seat has its own Ed25519 keypair. Each forwarded relay is signed by the sending seat. A target seat only accepts inbound relays from seats it links back to, so the graph can be open-ended without becoming an all-to-all broadcast.
+Now both shells are armed in the same cwd and join the same relay graph. Every seat has its own Ed25519 keypair. Each forwarded relay is signed by the sending seat. A target seat only accepts inbound relays when the sender linked to that target, so the graph can be open-ended without becoming an all-to-all broadcast.
 
 `link <seat> flow on` means that outbound edge sends commentary and final answers. `link <seat> flow off` means that outbound edge sends final answers only. This is sender-side routing, not receiver-side filtering.
 
@@ -79,7 +79,7 @@ muuuuse stop
 
 - state lives under `~/.muuuuse`
 - all armed seats in the same cwd share one relay session graph
-- only signed relays from reciprocally linked seats are accepted
+- only signed relays from senders that linked the target seat are accepted
 - `continue <seat>` is a convenience alias for a single signed outbound link
 - supported relay detection is built for Codex, Claude, and Gemini
 

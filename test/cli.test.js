@@ -1107,10 +1107,10 @@ async function testEvenSeatCanStartBeforeOddSeat() {
 async function testContinuationTargetsChainAcrossPairs() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[2, "off"], [4, "off"]] }) });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[1, "off"], [3, "on"]] }) });
-  const seat3 = spawnSeat(3, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[2, "on"], [4, "on"]] }) });
-  const seat4 = spawnSeat(4, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[3, "off"], [1, "off"]] }) });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[3, "on"]] }) });
+  const seat3 = spawnSeat(3, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[4, "on"]] }) });
+  const seat4 = spawnSeat(4, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1132,18 +1132,18 @@ async function testContinuationTargetsChainAcrossPairs() {
     await waitForStatus(home, cwd, /seat 2: running .*flow on/i);
     await waitForStatus(home, cwd, /seat 3: running .*flow on/i);
     await waitForStatus(home, cwd, /seat 4: running .*flow off/i);
-    await waitForStatus(home, cwd, /seat 1: running .*links 2:off, 4:off/i);
-    await waitForStatus(home, cwd, /seat 2: running .*links 1:off, 3:on/i);
-    await waitForStatus(home, cwd, /seat 3: running .*links 2:on, 4:on/i);
-    await waitForStatus(home, cwd, /seat 4: running .*links 3:off, 1:off/i);
+    await waitForStatus(home, cwd, /seat 1: running .*links 2:off/i);
+    await waitForStatus(home, cwd, /seat 2: running .*links 3:on/i);
+    await waitForStatus(home, cwd, /seat 3: running .*links 4:on/i);
+    await waitForStatus(home, cwd, /seat 4: running .*links 1:off/i);
 
     const liveStatus = execFileSync(process.execPath, [binPath, "status"], {
       encoding: "utf8",
       cwd,
       env: buildEnv(home),
     });
-    assert.match(liveStatus, /seat 2: running .*links 1:off, 3:on/i);
-    assert.match(liveStatus, /seat 4: running .*links 3:off, 1:off/i);
+    assert.match(liveStatus, /seat 2: running .*links 3:on/i);
+    assert.match(liveStatus, /seat 4: running .*links 1:off/i);
 
     seat1.write("ignite\r");
 
@@ -1190,10 +1190,10 @@ async function testContinuationTargetsChainAcrossPairs() {
 async function testFlowOffContinuationSuppressesCommentary() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-phase-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-phase-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[2, "off"], [4, "off"]] }) });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[1, "off"], [3, "on"]] }) });
-  const seat3 = spawnSeat(3, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[2, "on"], [4, "on"]] }) });
-  const seat4 = spawnSeat(4, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[3, "off"], [1, "off"]] }) });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[3, "on"]] }) });
+  const seat3 = spawnSeat(3, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[4, "on"]] }) });
+  const seat4 = spawnSeat(4, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1212,7 +1212,7 @@ async function testFlowOffContinuationSuppressesCommentary() {
     await seat4.waitFor(/gemini-ready/);
 
     await waitForStatus(home, cwd, /seat 4: running .*flow off/i);
-    await waitForStatus(home, cwd, /seat 4: running .*links 3:off, 1:off/i);
+    await waitForStatus(home, cwd, /seat 4: running .*links 1:off/i);
 
     seat1.write("ignite\r");
 
@@ -1243,7 +1243,7 @@ async function testStandaloneLinksRouteWithoutPairDependency() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-standalone-link-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-standalone-link-cwd-"));
   const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[3, "off"]] }) });
-  const seat3 = spawnSeat(3, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat3 = spawnSeat(3, { cwd, home });
 
   try {
     await seat2.waitFor(/seat 2 armed/i);
@@ -1255,7 +1255,6 @@ async function testStandaloneLinksRouteWithoutPairDependency() {
     await seat2.waitFor(/codex-ready/);
     await seat3.waitFor(/gemini-submit-ready/);
     await waitForStatus(home, cwd, /seat 2: running .*links 3:off/i);
-    await waitForStatus(home, cwd, /seat 3: running .*links 2:off/i);
 
     seat2.write("ignite\r");
 
@@ -1272,7 +1271,7 @@ async function testDirectionalPartnerLinksOverrideReceiverFlow() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-partner-link-on-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-partner-link-on-cwd-"));
   const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "on"]] }) });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1284,7 +1283,6 @@ async function testDirectionalPartnerLinksOverrideReceiverFlow() {
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-submit-ready/);
     await waitForStatus(home, cwd, /seat 1: running .*flow off.*links 2:on/i);
-    await waitForStatus(home, cwd, /seat 2: running .*flow off.*links 1:off/i);
 
     seat1.write("Reply with exactly PARTNER_LINK_ON\r");
 
@@ -1301,7 +1299,7 @@ async function testDirectionalPartnerLinksOverrideReceiverFlow() {
 async function testDirectionalPartnerLinksSuppressReverseCommentary() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-partner-link-off-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-partner-link-off-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "on"]] }) });
+  const seat1 = spawnSeat(1, { cwd, home });
   const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
@@ -1313,7 +1311,6 @@ async function testDirectionalPartnerLinksSuppressReverseCommentary() {
 
     await seat1.waitFor(/gemini-submit-ready/);
     await seat2.waitFor(/codex-ready/);
-    await waitForStatus(home, cwd, /seat 1: running .*flow off.*links 2:on/i);
     await waitForStatus(home, cwd, /seat 2: running .*flow off.*links 1:off/i);
 
     seat2.write("Reply with exactly PARTNER_LINK_OFF\r");
@@ -1335,10 +1332,10 @@ async function testLinkSyntaxFansOutAcrossTargets() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-link-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-link-cwd-"));
   const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "on"], [3, "off"], [5, "off"]] }) });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[1, "on"]] }) });
-  const seat3 = spawnSeat(3, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ flowMode: "on" }) });
+  const seat3 = spawnSeat(3, { cwd, home });
   const seat4 = spawnSeat(4, { cwd, home });
-  const seat5 = spawnSeat(5, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
+  const seat5 = spawnSeat(5, { cwd, home });
   const seat6 = spawnSeat(6, { cwd, home });
 
   try {
@@ -1360,9 +1357,7 @@ async function testLinkSyntaxFansOutAcrossTargets() {
     await seat5.waitFor(/gemini-submit-ready/);
 
     await waitForStatus(home, cwd, /seat 1: running .*flow off.*links 2:on, 3:off, 5:off/i);
-    await waitForStatus(home, cwd, /seat 2: running .*flow on.*links 1:on/i);
-    await waitForStatus(home, cwd, /seat 3: running .*links 1:off/i);
-    await waitForStatus(home, cwd, /seat 5: running .*links 1:off/i);
+    await waitForStatus(home, cwd, /seat 2: running .*flow on/i);
 
     seat1.write("Reply with exactly ROUTE_ONE\r");
 
@@ -1394,7 +1389,7 @@ async function testGeminiReceiverNeedsCrSubmit() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-submit-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-submit-cwd-"));
   const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1406,7 +1401,6 @@ async function testGeminiReceiverNeedsCrSubmit() {
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-submit-ready/);
     await waitForStatus(home, cwd, /seat 1: running .*links 2:off/i);
-    await waitForStatus(home, cwd, /seat 2: running .*links 1:off/i);
 
     seat1.write("ignite\r");
 

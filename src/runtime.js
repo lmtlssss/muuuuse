@@ -872,13 +872,33 @@ class ArmedSeat {
     return Number.isFinite(requestedAtMs) && requestedAtMs > this.startedAtMs;
   }
 
-  hasAuthorizedSource(sourceSeatId) {
+  sourceLinksToTarget(sourceSeatId, targetSeatId = this.seatId) {
     const desiredSeatId = normalizeSeatId(sourceSeatId);
-    if (!desiredSeatId) {
+    const desiredTargetSeatId = normalizeSeatId(targetSeatId);
+    if (!desiredSeatId || !desiredTargetSeatId) {
       return false;
     }
 
-    return this.getConfiguredTargets().some((target) => target.seatId === desiredSeatId);
+    const sourcePaths = getSeatPaths(this.sessionName, desiredSeatId);
+    const sourceStatus = readJson(sourcePaths.statusPath, null);
+    const sourceMeta = readJson(sourcePaths.metaPath, null);
+    const sourceContinueSeatId = sourceStatus?.continueSeatId || sourceMeta?.continueSeatId || null;
+    const sourceContinueTargets = normalizeContinueTargets(
+      sourceStatus?.continueTargets || sourceMeta?.continueTargets
+    );
+
+    const configuredTargets = [...sourceContinueTargets];
+    if (
+      sourceContinueSeatId &&
+      !configuredTargets.some((target) => target.seatId === normalizeSeatId(sourceContinueSeatId))
+    ) {
+      configuredTargets.push({
+        seatId: normalizeSeatId(sourceContinueSeatId),
+        flowMode: normalizeFlowMode(sourceStatus?.flowMode || sourceMeta?.flowMode),
+      });
+    }
+
+    return configuredTargets.some((target) => target.seatId === desiredTargetSeatId);
   }
 
   readSourcePublicKey(sourceSeatId) {
@@ -922,7 +942,7 @@ class ArmedSeat {
     const sourceSeatId = normalizeSeatId(entry?.sourceSeatId || entry?.seatId);
     const targetSeatId = normalizeSeatId(entry?.targetSeatId);
     const payload = sanitizeRelayText(entry?.text);
-    if (!sourceSeatId || targetSeatId !== this.seatId || !payload || !this.hasAuthorizedSource(sourceSeatId)) {
+    if (!sourceSeatId || targetSeatId !== this.seatId || !payload || !this.sourceLinksToTarget(sourceSeatId, targetSeatId)) {
       return false;
     }
 
@@ -1348,7 +1368,7 @@ class ArmedSeat {
         `Seat ${this.seatId} links signed relay targets: ${configuredTargets.map((target) => `${target.seatId}:${target.flowMode}`).join(", ")}.`
       );
     }
-    this.log("Signed relays are accepted only from seats that this seat links back to.");
+    this.log("Signed relays are accepted when the sender linked to this seat.");
     this.log("Run `muuuuse status` or `muuuuse stop` from any terminal.");
 
     try {

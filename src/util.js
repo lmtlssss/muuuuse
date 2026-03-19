@@ -296,7 +296,7 @@ function usage() {
     "  4. `flow on` sends commentary and final answers on that edge. `flow off` sends final answers only.",
     "  5. `continue <seat>` is shorthand for one outbound link that uses the seat's default `flow on|off`.",
     "  6. Every forwarded relay is signed with the sender seat's key.",
-    "  7. A seat only accepts signed inbound relays from seats it links back to.",
+    "  7. A seat only accepts signed inbound relays when the sender linked to that seat.",
     "  8. Use those armed shells normally.",
     "  9. Run `muuuuse status` or `muuuuse stop` from any shell.",
     "",
