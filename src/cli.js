@@ -1,4 +1,4 @@
-const { BRAND, getPartnerSeatId, normalizeSeatId, usage } = require("./util");
+const { BRAND, normalizeSeatId, usage } = require("./util");
 const { ArmedSeat, getStatusReport, stopAllSessions } = require("./runtime");
 
 async function main(argv = process.argv.slice(2)) {
@@ -81,17 +81,11 @@ function renderSeatStatus(seat) {
     `child ${seat.childPid || "-"}`,
   ];
 
-  if (seat.partnerLive) {
-    bits.push("peer live");
-  }
   if (seat.continueSeatId) {
     bits.push(`continue ${seat.continueSeatId}`);
   }
   if (Array.isArray(seat.continueTargets) && seat.continueTargets.length > 0) {
     bits.push(`links ${renderLinkTargets(seat.continueTargets)}`);
-  }
-  if (seat.trust) {
-    bits.push(`trust ${seat.trust}`);
   }
   if (seat.lastAnswerAt) {
     bits.push(`last answer ${seat.lastAnswerAt}`);
@@ -115,7 +109,6 @@ function renderLinkTargets(targets) {
 
 function parseSeatOptions(command, args) {
   const seatId = normalizeSeatId(command);
-  const partnerSeatId = getPartnerSeatId(seatId);
   let flowMode = "off";
   let continueSeatId = null;
   let continueTargets = [];
@@ -145,7 +138,7 @@ function parseSeatOptions(command, args) {
     }
 
     if (token === "link") {
-      const parsed = parseLinkTargets(seatId, partnerSeatId, args, index + 1);
+      const parsed = parseLinkTargets(seatId, args, index + 1);
       if (!parsed) {
         break;
       }
@@ -179,7 +172,7 @@ function mergeTargets(currentTargets, nextTargets) {
   return merged;
 }
 
-function parseLinkTargets(seatId, partnerSeatId, args, startIndex) {
+function parseLinkTargets(seatId, args, startIndex) {
   let index = startIndex;
   const continueTargets = [];
 

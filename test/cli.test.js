@@ -614,8 +614,8 @@ function testCodexWaitsInsteadOfStealingSiblingSession() {
 async function testForgedPartnerEventsAreIgnored() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-signed-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-signed-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home });
-  const seat2 = spawnSeat(2, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -627,19 +627,17 @@ async function testForgedPartnerEventsAreIgnored() {
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-ready/);
-
-    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
-
-    const forgedEventsPath = path.join(home, ".muuuuse", "sessions", sessionName, "seat-2", "events.jsonl");
-    fs.appendFileSync(forgedEventsPath, `${JSON.stringify({
+    const forgedContinuePath = path.join(home, ".muuuuse", "sessions", sessionName, "seat-1", "continue.jsonl");
+    fs.appendFileSync(forgedContinuePath, `${JSON.stringify({
       id: "forged-answer",
-      type: "answer",
-      seatId: 2,
+      type: "continue",
+      sourceSeatId: 2,
+      targetSeatId: 1,
       origin: "gemini",
       text: "FORGED",
       createdAt: new Date().toISOString(),
-      challenge: "wrong",
+      chainId: "forged-chain",
+      hop: 1,
       publicKey: "not-a-real-key",
       signature: "not-a-real-signature",
     })}\n`);
@@ -660,8 +658,8 @@ async function testForgedPartnerEventsAreIgnored() {
 async function testDuplicateAnswerIdsAreDeduped() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-duplicate-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-duplicate-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home });
-  const seat2 = spawnSeat(2, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -673,10 +671,6 @@ async function testDuplicateAnswerIdsAreDeduped() {
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-ready/);
-
-    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
-
     seat1.write("go\r");
 
     await seat1.waitFor(/\bONE\b/);
@@ -698,8 +692,8 @@ async function testDuplicateAnswerIdsAreDeduped() {
 async function testMirrorRepliesDoNotPingPong() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-mirror-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-mirror-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home });
-  const seat2 = spawnSeat(2, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -755,8 +749,8 @@ async function testMirrorRepliesDoNotPingPong() {
 async function testAlternatingRepliesContinueUntilStopped() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-alternating-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-alternating-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home });
-  const seat2 = spawnSeat(2, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -768,10 +762,6 @@ async function testAlternatingRepliesContinueUntilStopped() {
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-ready/);
-
-    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
-
     seat1.write("go\r");
 
     await seat1.waitFor(/\bONE\b/);
@@ -797,8 +787,8 @@ async function testAlternatingRepliesContinueUntilStopped() {
 async function testMixedFlowModesAllowContinuedReplies() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-mixed-flow-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-mixed-flow-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["flow", "off"] });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "on"] });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[1, "on"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -810,10 +800,6 @@ async function testMixedFlowModesAllowContinuedReplies() {
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-ready/);
-
-    await waitForStatus(home, cwd, /seat 1: running .*flow off.*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*flow on.*trust paired/i);
-
     seat1.write("go\r");
 
     await seat1.waitFor(/\bONE\b/);
@@ -841,8 +827,8 @@ async function testMixedFlowModesAllowContinuedReplies() {
 async function testQueuedRepliesAfterInboundAreRelayed() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-queued-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-queued-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home });
-  const seat2 = spawnSeat(2, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -854,10 +840,6 @@ async function testQueuedRepliesAfterInboundAreRelayed() {
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-ready/);
-
-    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
-
     seat1.write("go\r");
 
     await seat1.waitFor(/\bONE\b/);
@@ -882,8 +864,8 @@ async function testQueuedRepliesAfterInboundAreRelayed() {
 async function testMultilineRelaySubmitsOnce() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-multiline-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-multiline-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home });
-  const seat2 = spawnSeat(2, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -895,10 +877,6 @@ async function testMultilineRelaySubmitsOnce() {
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-ready/);
-
-    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
-
     seat1.write("go\r");
 
     await seat1.waitFor(/ALPHA/);
@@ -923,8 +901,8 @@ async function testMultilineRelaySubmitsOnce() {
 async function testPassiveTerminalReportsDoNotClearRelayContext() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-passive-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-passive-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home });
-  const seat2 = spawnSeat(2, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -936,10 +914,6 @@ async function testPassiveTerminalReportsDoNotClearRelayContext() {
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-ready/);
-
-    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
-
     seat1.write("go\r");
 
     await seat1.waitFor(/\bONE\b/);
@@ -966,8 +940,8 @@ async function testPassiveTerminalReportsDoNotClearRelayContext() {
 async function testBareEscapeDoesNotClearRelayContext() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-escape-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-escape-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home });
-  const seat2 = spawnSeat(2, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -979,10 +953,6 @@ async function testBareEscapeDoesNotClearRelayContext() {
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-ready/);
-
-    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
-
     seat1.write("go\r");
 
     await seat1.waitFor(/\bONE\b/);
@@ -1009,8 +979,8 @@ async function testBareEscapeDoesNotClearRelayContext() {
 async function testSeatSpecificFlowModes() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-flow-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-flow-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["flow", "on"] });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "off"] });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[2, "on"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1035,8 +1005,8 @@ async function testSeatSpecificFlowModes() {
     const seat2Buffer = seat2.getBuffer();
 
     assert(seat1Events.some((entry) => entry.text.includes("FLOW_ON")));
-    assert.doesNotMatch(seat2Buffer, /Thinking about:/);
-    assert.doesNotMatch(seat2Buffer, /Still reasoning on turn 1\./);
+    assert.match(seat2Buffer, /Thinking about:/);
+    assert.match(seat2Buffer, /Still reasoning on turn 1\./);
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();
@@ -1047,10 +1017,10 @@ async function testSeatSpecificFlowModes() {
 async function testAdditionalPairsStaySeparate() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-pairs-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-pairs-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home });
-  const seat2 = spawnSeat(2, { cwd, home });
-  const seat3 = spawnSeat(3, { cwd, home });
-  const seat4 = spawnSeat(4, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
+  const seat3 = spawnSeat(3, { cwd, home, extraArgs: seatArgs({ links: [[4, "off"]] }) });
+  const seat4 = spawnSeat(4, { cwd, home, extraArgs: seatArgs({ links: [[3, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1067,12 +1037,6 @@ async function testAdditionalPairsStaySeparate() {
     await seat2.waitFor(/gemini-ready/);
     await seat3.waitFor(/codex-ready/);
     await seat4.waitFor(/gemini-ready/);
-
-    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 3: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 4: running .*trust paired/i);
-
     seat1.write("ignite-one\r");
     seat3.write("ignite-three\r");
 
@@ -1086,23 +1050,16 @@ async function testAdditionalPairsStaySeparate() {
     await seat4.waitFor(/\bFOUR\b/);
     await sleep(1600);
 
-    const sessionNames = await waitForSessionNames(home, 2);
-    const pair12 = sessionNames.find((sessionName) => readAnswerEvents(home, sessionName, 1).length > 0);
-    const pair34 = sessionNames.find((sessionName) => readAnswerEvents(home, sessionName, 3).length > 0);
+    const [sessionName] = await waitForSessionNames(home, 1);
+    const seat1Events = readAnswerEvents(home, sessionName, 1);
+    const seat2Events = readAnswerEvents(home, sessionName, 2);
+    const seat3Events = readAnswerEvents(home, sessionName, 3);
+    const seat4Events = readAnswerEvents(home, sessionName, 4);
 
-    assert(pair12, "expected a distinct session for seats 1/2");
-    assert(pair34, "expected a distinct session for seats 3/4");
-    assert.notEqual(pair12, pair34);
-
-    const pair12Seat1 = readAnswerEvents(home, pair12, 1);
-    const pair12Seat2 = readAnswerEvents(home, pair12, 2);
-    const pair34Seat3 = readAnswerEvents(home, pair34, 3);
-    const pair34Seat4 = readAnswerEvents(home, pair34, 4);
-
-    assert.equal(pair12Seat1[0].text, "ONE");
-    assert.equal(pair12Seat2[0].text, "TWO");
-    assert.equal(pair34Seat3[0].text, "THREE");
-    assert.equal(pair34Seat4[0].text, "FOUR");
+    assert.equal(seat1Events[0].text, "ONE");
+    assert.equal(seat2Events[0].text, "TWO");
+    assert.equal(seat3Events[0].text, "THREE");
+    assert.equal(seat4Events[0].text, "FOUR");
 
     assert.doesNotMatch(seat2.getBuffer(), /\bTHREE\b|\bFOUR\b/);
     assert.doesNotMatch(seat4.getBuffer(), /\bONE\b|\bTWO\b/);
@@ -1118,14 +1075,13 @@ async function testAdditionalPairsStaySeparate() {
 async function testEvenSeatCanStartBeforeOddSeat() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-even-first-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-even-first-cwd-"));
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "on"] });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[1, "on"]] }) });
   let seat1 = null;
 
   try {
     await seat2.waitFor(/seat 2 armed/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust waiting_for_anchor_key/i);
 
-    seat1 = spawnSeat(1, { cwd, home, extraArgs: ["flow", "on"] });
+    seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[2, "on"]] }) });
     await seat1.waitFor(/seat 1 armed/i);
 
     seat1.write(`${shellQuote(noisyCodexPath)}\r`);
@@ -1133,8 +1089,6 @@ async function testEvenSeatCanStartBeforeOddSeat() {
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-submit-ready/);
-    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
 
     seat1.write("Reply with exactly EVEN_FIRST\r");
 
@@ -1153,10 +1107,10 @@ async function testEvenSeatCanStartBeforeOddSeat() {
 async function testContinuationTargetsChainAcrossPairs() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["flow", "off"] });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "on", "continue", "3"] });
-  const seat3 = spawnSeat(3, { cwd, home, extraArgs: ["flow", "on"] });
-  const seat4 = spawnSeat(4, { cwd, home, extraArgs: ["flow", "off", "continue", "1"] });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[2, "off"], [4, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[1, "off"], [3, "on"]] }) });
+  const seat3 = spawnSeat(3, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[2, "on"], [4, "on"]] }) });
+  const seat4 = spawnSeat(4, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[3, "off"], [1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1178,18 +1132,18 @@ async function testContinuationTargetsChainAcrossPairs() {
     await waitForStatus(home, cwd, /seat 2: running .*flow on/i);
     await waitForStatus(home, cwd, /seat 3: running .*flow on/i);
     await waitForStatus(home, cwd, /seat 4: running .*flow off/i);
-    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 3: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 4: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 1: running .*links 2:off, 4:off/i);
+    await waitForStatus(home, cwd, /seat 2: running .*links 1:off, 3:on/i);
+    await waitForStatus(home, cwd, /seat 3: running .*links 2:on, 4:on/i);
+    await waitForStatus(home, cwd, /seat 4: running .*links 3:off, 1:off/i);
 
     const liveStatus = execFileSync(process.execPath, [binPath, "status"], {
       encoding: "utf8",
       cwd,
       env: buildEnv(home),
     });
-    assert.match(liveStatus, /seat 2: running .*continue 3/i);
-    assert.match(liveStatus, /seat 4: running .*continue 1/i);
+    assert.match(liveStatus, /seat 2: running .*links 1:off, 3:on/i);
+    assert.match(liveStatus, /seat 4: running .*links 3:off, 1:off/i);
 
     seat1.write("ignite\r");
 
@@ -1214,23 +1168,16 @@ async function testContinuationTargetsChainAcrossPairs() {
       return sessions.some((sessionName) => readAnswerEvents(home, sessionName, 1).filter((entry) => entry.text === "ONE").length >= 2);
     }, 15000, "looped seat 1 answer");
 
-    const sessionNames = await waitForSessionNames(home, 2);
-    const pair12 = sessionNames.find((sessionName) => readAnswerEvents(home, sessionName, 1).length > 0);
-    const pair34 = sessionNames.find((sessionName) => readAnswerEvents(home, sessionName, 3).length > 0);
-
-    assert(pair12, "expected a distinct session for seats 1/2");
-    assert(pair34, "expected a distinct session for seats 3/4");
-    assert.notEqual(pair12, pair34);
-
-    const seat1Events = readAnswerEvents(home, pair12, 1);
-    const seat2Events = readAnswerEvents(home, pair12, 2);
-    const seat3Events = readAnswerEvents(home, pair34, 3);
-    const seat4Events = readAnswerEvents(home, pair34, 4);
+    const [sessionName] = await waitForSessionNames(home, 1);
+    const seat1Events = readAnswerEvents(home, sessionName, 1);
+    const seat2Events = readAnswerEvents(home, sessionName, 2);
+    const seat3Events = readAnswerEvents(home, sessionName, 3);
+    const seat4Events = readAnswerEvents(home, sessionName, 4);
 
     assert(seat1Events.filter((entry) => entry.text === "ONE").length >= 2);
-    assert.equal(seat2Events[0].text, "TWO");
-    assert.equal(seat3Events[0].text, "THREE");
-    assert.equal(seat4Events[0].text, "FOUR");
+    assert(seat2Events.some((entry) => entry.text === "TWO"));
+    assert(seat3Events.some((entry) => entry.text === "THREE"));
+    assert(seat4Events.some((entry) => entry.text === "FOUR"));
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();
@@ -1243,10 +1190,10 @@ async function testContinuationTargetsChainAcrossPairs() {
 async function testFlowOffContinuationSuppressesCommentary() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-phase-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-continue-phase-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["flow", "off"] });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "on", "continue", "3"] });
-  const seat3 = spawnSeat(3, { cwd, home, extraArgs: ["flow", "on"] });
-  const seat4 = spawnSeat(4, { cwd, home, extraArgs: ["flow", "off", "continue", "1"] });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[2, "off"], [4, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[1, "off"], [3, "on"]] }) });
+  const seat3 = spawnSeat(3, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[2, "on"], [4, "on"]] }) });
+  const seat4 = spawnSeat(4, { cwd, home, extraArgs: seatArgs({ flowMode: "off", links: [[3, "off"], [1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1265,7 +1212,7 @@ async function testFlowOffContinuationSuppressesCommentary() {
     await seat4.waitFor(/gemini-ready/);
 
     await waitForStatus(home, cwd, /seat 4: running .*flow off/i);
-    await waitForStatus(home, cwd, /seat 4: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 4: running .*links 3:off, 1:off/i);
 
     seat1.write("ignite\r");
 
@@ -1295,8 +1242,8 @@ async function testFlowOffContinuationSuppressesCommentary() {
 async function testStandaloneLinksRouteWithoutPairDependency() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-standalone-link-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-standalone-link-cwd-"));
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["link", "3", "flow", "off"] });
-  const seat3 = spawnSeat(3, { cwd, home });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[3, "off"]] }) });
+  const seat3 = spawnSeat(3, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
 
   try {
     await seat2.waitFor(/seat 2 armed/i);
@@ -1308,8 +1255,7 @@ async function testStandaloneLinksRouteWithoutPairDependency() {
     await seat2.waitFor(/codex-ready/);
     await seat3.waitFor(/gemini-submit-ready/);
     await waitForStatus(home, cwd, /seat 2: running .*links 3:off/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust waiting_for_anchor_key/i);
-    await waitForStatus(home, cwd, /seat 3: running .*trust waiting_for_peer_signature/i);
+    await waitForStatus(home, cwd, /seat 3: running .*links 2:off/i);
 
     seat2.write("ignite\r");
 
@@ -1325,8 +1271,8 @@ async function testStandaloneLinksRouteWithoutPairDependency() {
 async function testDirectionalPartnerLinksOverrideReceiverFlow() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-partner-link-on-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-partner-link-on-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["link", "2", "flow", "on"] });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["link", "1", "flow", "off"] });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "on"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1337,8 +1283,8 @@ async function testDirectionalPartnerLinksOverrideReceiverFlow() {
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-submit-ready/);
-    await waitForStatus(home, cwd, /seat 1: running .*flow off.*links 2:on.*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*flow off.*links 1:off.*trust paired/i);
+    await waitForStatus(home, cwd, /seat 1: running .*flow off.*links 2:on/i);
+    await waitForStatus(home, cwd, /seat 2: running .*flow off.*links 1:off/i);
 
     seat1.write("Reply with exactly PARTNER_LINK_ON\r");
 
@@ -1355,8 +1301,8 @@ async function testDirectionalPartnerLinksOverrideReceiverFlow() {
 async function testDirectionalPartnerLinksSuppressReverseCommentary() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-partner-link-off-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-partner-link-off-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["link", "2", "flow", "on"] });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["link", "1", "flow", "off"] });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "on"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1367,8 +1313,8 @@ async function testDirectionalPartnerLinksSuppressReverseCommentary() {
 
     await seat1.waitFor(/gemini-submit-ready/);
     await seat2.waitFor(/codex-ready/);
-    await waitForStatus(home, cwd, /seat 1: running .*flow off.*links 2:on.*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*flow off.*links 1:off.*trust paired/i);
+    await waitForStatus(home, cwd, /seat 1: running .*flow off.*links 2:on/i);
+    await waitForStatus(home, cwd, /seat 2: running .*flow off.*links 1:off/i);
 
     seat2.write("Reply with exactly PARTNER_LINK_OFF\r");
 
@@ -1388,11 +1334,11 @@ async function testDirectionalPartnerLinksSuppressReverseCommentary() {
 async function testLinkSyntaxFansOutAcrossTargets() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-link-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-link-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home, extraArgs: ["link", "2", "flow", "on", "3", "flow", "off", "5", "flow", "off"] });
-  const seat2 = spawnSeat(2, { cwd, home, extraArgs: ["flow", "on"] });
-  const seat3 = spawnSeat(3, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "on"], [3, "off"], [5, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ flowMode: "on", links: [[1, "on"]] }) });
+  const seat3 = spawnSeat(3, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
   const seat4 = spawnSeat(4, { cwd, home });
-  const seat5 = spawnSeat(5, { cwd, home });
+  const seat5 = spawnSeat(5, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
   const seat6 = spawnSeat(6, { cwd, home });
 
   try {
@@ -1414,7 +1360,9 @@ async function testLinkSyntaxFansOutAcrossTargets() {
     await seat5.waitFor(/gemini-submit-ready/);
 
     await waitForStatus(home, cwd, /seat 1: running .*flow off.*links 2:on, 3:off, 5:off/i);
-    await waitForStatus(home, cwd, /seat 2: running .*flow on.*trust paired/i);
+    await waitForStatus(home, cwd, /seat 2: running .*flow on.*links 1:on/i);
+    await waitForStatus(home, cwd, /seat 3: running .*links 1:off/i);
+    await waitForStatus(home, cwd, /seat 5: running .*links 1:off/i);
 
     seat1.write("Reply with exactly ROUTE_ONE\r");
 
@@ -1445,8 +1393,8 @@ async function testLinkSyntaxFansOutAcrossTargets() {
 async function testGeminiReceiverNeedsCrSubmit() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-submit-home-"));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-submit-cwd-"));
-  const seat1 = spawnSeat(1, { cwd, home });
-  const seat2 = spawnSeat(2, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1457,8 +1405,8 @@ async function testGeminiReceiverNeedsCrSubmit() {
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-submit-ready/);
-    await waitForStatus(home, cwd, /seat 1: running .*trust paired/i);
-    await waitForStatus(home, cwd, /seat 2: running .*trust paired/i);
+    await waitForStatus(home, cwd, /seat 1: running .*links 2:off/i);
+    await waitForStatus(home, cwd, /seat 2: running .*links 1:off/i);
 
     seat1.write("ignite\r");
 
@@ -1515,8 +1463,8 @@ async function testStopSilencesBellLoop() {
 }
 
 async function runRelayCycle({ cycle, cwd, home }) {
-  const seat1 = spawnSeat(1, { cwd, home });
-  const seat2 = spawnSeat(2, { cwd, home });
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
 
   try {
     await seat1.waitFor(/seat 1 armed/i);
@@ -1640,6 +1588,23 @@ function spawnSeat(seatId, { cwd, home, extraArgs = [] }) {
       }
     },
   };
+}
+
+function seatArgs({ flowMode = null, continueSeatId = null, links = [] } = {}) {
+  const args = [];
+  if (flowMode) {
+    args.push("flow", flowMode);
+  }
+  if (continueSeatId != null) {
+    args.push("continue", String(continueSeatId));
+  }
+  if (links.length > 0) {
+    args.push("link");
+    for (const [seatId, targetFlowMode] of links) {
+      args.push(String(seatId), "flow", targetFlowMode);
+    }
+  }
+  return args;
 }
 
 function readAnswerEvents(home, sessionName, seatId) {

@@ -175,18 +175,6 @@ function normalizeSeatId(value) {
   return seatId;
 }
 
-function isAnchorSeat(seatId) {
-  return normalizeSeatId(seatId) % 2 === 1;
-}
-
-function getPartnerSeatId(seatId) {
-  const normalized = normalizeSeatId(seatId);
-  if (!normalized) {
-    return null;
-  }
-  return isAnchorSeat(normalized) ? normalized + 1 : normalized - 1;
-}
-
 function listSeatIds(sessionName) {
   const sessionDir = getSessionDir(sessionName);
   try {
@@ -282,7 +270,7 @@ function listSessionNames() {
 
 function usage() {
   return [
-    `${BRAND} arms regular terminals and relays assistant output across odd/even partners plus explicit links.`,
+    `${BRAND} arms regular terminals and relays assistant output across signed terminal links.`,
     "",
     "Usage:",
     "  muuuuse 1",
@@ -303,15 +291,14 @@ function usage() {
     "",
     "Flow:",
     "  1. Run `muuuuse <seat>` in the terminal you want to arm.",
-    "  2. Matching odd/even partners still auto-pair when both seats are armed, in either order.",
-    "  3. Additional pairs work the same way: `3/4`, `5/6`, `7/8`...",
-    "  4. Optional: arm each seat with `flow on` or `flow off`.",
-    "  5. Optional: add `continue <seat>` to forward that seat's relayed output into another armed seat.",
-    "  6. Or use `link <seat> flow on|off ...` to fan out to multiple armed seats.",
-    "  7. Standalone seats can still route through links even before a pair partner joins.",
+    "  2. All armed seats in the same cwd join one relay graph.",
+    "  3. Use `link <seat> flow on|off ...` to define each outbound relay edge.",
+    "  4. `flow on` sends commentary and final answers on that edge. `flow off` sends final answers only.",
+    "  5. `continue <seat>` is shorthand for one outbound link that uses the seat's default `flow on|off`.",
+    "  6. Every forwarded relay is signed with the sender seat's key.",
+    "  7. A seat only accepts signed inbound relays from seats it links back to.",
     "  8. Use those armed shells normally.",
-    "  9. `flow off` sends final answers only. `flow on` keeps assistant commentary bouncing.",
-    "  10. Run `muuuuse status` or `muuuuse stop` from any shell.",
+    "  9. Run `muuuuse status` or `muuuuse stop` from any shell.",
     "",
     "Notes:",
     "  - `muuuuse stop` and `muuuuse status` work from another terminal or the same one.",
@@ -328,9 +315,7 @@ module.exports = {
   ensureDir,
   getDefaultSessionName,
   getFileSize,
-  getPartnerSeatId,
   loadOrCreateSeatIdentity,
-  isAnchorSeat,
   getSeatPaths,
   getSessionPaths,
   getStateRoot,

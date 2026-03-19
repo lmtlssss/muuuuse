@@ -20,12 +20,10 @@ const {
   ensureDir,
   getDefaultSessionName,
   getFileSize,
-  getPartnerSeatId,
   getSeatPaths,
   getSessionPaths,
   getStateRoot,
   hashText,
-  isAnchorSeat,
   isPidAlive,
   listSeatIds,
   loadOrCreateSeatIdentity,
@@ -189,50 +187,37 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function findJoinableSessionName(currentPath = process.cwd(), seatId = 2) {
-  const normalizedSeatId = normalizeSeatId(seatId);
-  const partnerSeatId = getPartnerSeatId(normalizedSeatId);
-  if (!normalizedSeatId || !partnerSeatId) {
-    return null;
-  }
-
+function findExistingSessionName(currentPath = process.cwd()) {
   const candidates = listSessionNames()
     .map((sessionName) => {
       const sessionPaths = getSessionPaths(sessionName);
       const controller = readJson(sessionPaths.controllerPath, null);
-      const partnerPaths = getSeatPaths(sessionName, partnerSeatId);
-      const seatPaths = getSeatPaths(sessionName, normalizedSeatId);
-      const partnerMeta = readJson(partnerPaths.metaPath, null);
-      const partnerStatus = readJson(partnerPaths.statusPath, null);
-      const seatMeta = readJson(seatPaths.metaPath, null);
-      const seatStatus = readJson(seatPaths.statusPath, null);
-      const stopRequest = readJson(sessionPaths.stopPath, null);
+      const seats = listSeatIds(sessionName)
+        .map((seatId) => buildSeatReport(sessionName, seatId))
+        .filter((entry) => entry !== null);
 
-      const cwd = controller?.cwd || partnerStatus?.cwd || partnerMeta?.cwd || seatStatus?.cwd || seatMeta?.cwd || null;
+      const cwd = controller?.cwd || seats[0]?.cwd || null;
       if (!matchesWorkingPath(cwd, currentPath)) {
         return null;
       }
 
-      const partnerWrapperPid = partnerStatus?.pid || partnerMeta?.pid || null;
-      const partnerChildPid = partnerStatus?.childPid || partnerMeta?.childPid || null;
-      const seatWrapperPid = seatStatus?.pid || seatMeta?.pid || null;
-      const seatChildPid = seatStatus?.childPid || seatMeta?.childPid || null;
-      const partnerLive = isPidAlive(partnerWrapperPid) || isPidAlive(partnerChildPid);
-      const seatLive = isPidAlive(seatWrapperPid) || isPidAlive(seatChildPid);
-      const stopRequestedAtMs = Date.parse(stopRequest?.requestedAt || "");
-      const createdAtMs = Date.parse(controller?.createdAt || partnerMeta?.startedAt || partnerStatus?.updatedAt || "");
-
-      if (!partnerLive || seatLive) {
+      const controllerPid = controller?.pid || null;
+      const controllerLive = isPidAlive(controllerPid);
+      if (seats.length === 0 && !controllerLive) {
         return null;
       }
 
-      if (Number.isFinite(stopRequestedAtMs) && Number.isFinite(createdAtMs) && stopRequestedAtMs > createdAtMs) {
-        return null;
-      }
+      const createdAtMs = Date.parse(
+        controller?.createdAt ||
+        seats
+          .map((seat) => seat.startedAt || seat.updatedAt || "")
+          .find((value) => value) ||
+        ""
+      );
 
       return {
         sessionName,
-        createdAtMs,
+        createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : 0,
       };
     })
     .filter((entry) => entry !== null)
@@ -241,10 +226,10 @@ function findJoinableSessionName(currentPath = process.cwd(), seatId = 2) {
   return candidates[0]?.sessionName || null;
 }
 
-function waitForJoinableSessionName(currentPath = process.cwd(), seatId = 2, timeoutMs = SEAT_JOIN_WAIT_MS) {
+function waitForExistingSessionName(currentPath = process.cwd(), timeoutMs = SEAT_JOIN_WAIT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
-    const sessionName = findJoinableSessionName(currentPath, seatId);
+    const sessionName = findExistingSessionName(currentPath);
     if (sessionName) {
       return sessionName;
     }
@@ -255,16 +240,31 @@ function waitForJoinableSessionName(currentPath = process.cwd(), seatId = 2, tim
 }
 
 function resolveSessionName(currentPath = process.cwd(), seatId = 1) {
-  const joinableSessionName = findJoinableSessionName(currentPath, seatId);
-  if (joinableSessionName) {
-    return joinableSessionName;
+  const existingSessionName = findExistingSessionName(currentPath);
+  if (!existingSessionName) {
+    const normalizedSeatId = normalizeSeatId(seatId) || 1;
+    const joinWaitMs = Math.min(1000, Math.max(0, normalizedSeatId - 1) * 250);
+    const waitedSessionName = waitForExistingSessionName(currentPath, joinWaitMs);
+    if (!waitedSessionName) {
+      return createSessionName(currentPath);
+    }
+    const conflictingWaitedSeat = buildSeatReport(waitedSessionName, seatId);
+    if (conflictingWaitedSeat) {
+      throw new Error(
+        `Seat ${seatId} is already armed in this cwd. Stop it first or choose another seat number.`
+      );
+    }
+    return waitedSessionName;
   }
 
-  if (!isAnchorSeat(seatId)) {
-    return waitForJoinableSessionName(currentPath, seatId) || createSessionName(currentPath);
+  const conflictingSeat = buildSeatReport(existingSessionName, seatId);
+  if (conflictingSeat) {
+    throw new Error(
+      `Seat ${seatId} is already armed in this cwd. Stop it first or choose another seat number.`
+    );
   }
 
-  return createSessionName(currentPath);
+  return existingSessionName;
 }
 
 function parseAnswerEntries(text) {
@@ -466,40 +466,18 @@ function resolveSessionFile(agentType, agentPid, currentPath, captureSinceMs, pr
   return null;
 }
 
-function buildClaimMessage(sessionName, challenge, seat1PublicKey, seat2PublicKey) {
-  return JSON.stringify({
-    type: "muuuuse_pair_claim",
-    sessionName,
-    challenge,
-    seat1PublicKey,
-    seat2PublicKey,
-  });
-}
-
-function buildAckMessage(sessionName, challenge, seat1PublicKey, seat2PublicKey) {
-  return JSON.stringify({
-    type: "muuuuse_pair_ack",
-    sessionName,
-    challenge,
-    seat1PublicKey,
-    seat2PublicKey,
-  });
-}
-
 function buildAnswerSignaturePayload(sessionName, challenge, entry) {
   return JSON.stringify({
-    type: "muuuuse_answer",
+    type: "muuuuse_relay",
     sessionName,
-    challenge,
     chainId: entry.chainId,
     hop: entry.hop,
     id: entry.id,
-    seatId: entry.seatId,
+    sourceSeatId: normalizeSeatId(entry.sourceSeatId || entry.seatId),
+    targetSeatId: normalizeSeatId(entry.targetSeatId),
     origin: entry.origin,
-    phase: entry.phase || "final_answer",
+    phase: getRelayPhase(entry),
     createdAt: entry.createdAt,
-    targetSeatId: entry.targetSeatId || null,
-    targetFlowMode: normalizeFlowMode(entry.targetFlowMode),
     text: entry.text,
   });
 }
@@ -533,15 +511,6 @@ function shouldAcceptInboundEntry(flowMode, entry) {
   return flowMode === "on" || getRelayPhase(entry) === "final_answer";
 }
 
-function resolveInboundFlowMode(defaultFlowMode, seatId, entry) {
-  const targetSeatId = normalizeSeatId(entry?.targetSeatId);
-  if (targetSeatId === normalizeSeatId(seatId)) {
-    return normalizeFlowMode(entry?.targetFlowMode);
-  }
-
-  return normalizeFlowMode(defaultFlowMode);
-}
-
 function getSeatDirIfExists(sessionName, seatId) {
   const dir = path.join(getStateRoot(), "sessions", sessionName, `seat-${seatId}`);
   try {
@@ -552,24 +521,6 @@ function getSeatDirIfExists(sessionName, seatId) {
     return null;
   }
   return null;
-}
-
-function readSeatChallenge(paths, sessionName) {
-  const record = readJson(paths.challengePath, null);
-  if (
-    !record ||
-    record.sessionName !== sessionName ||
-    typeof record.challenge !== "string" ||
-    typeof record.publicKey !== "string"
-  ) {
-    return null;
-  }
-
-  return {
-    challenge: record.challenge,
-    publicKey: record.publicKey.trim(),
-    createdAt: record.createdAt || null,
-  };
 }
 
 function normalizeRelayPayloadForTyping(text) {
@@ -648,8 +599,6 @@ async function sendTextAndEnter(child, text, shouldAbort = () => false) {
 class ArmedSeat {
   constructor(options) {
     this.seatId = options.seatId;
-    this.partnerSeatId = getPartnerSeatId(options.seatId);
-    this.anchorSeatId = isAnchorSeat(options.seatId) ? options.seatId : this.partnerSeatId;
     this.flowMode = normalizeFlowMode(options.flowMode);
     this.continueSeatId = normalizeContinueSeatId(options.continueSeatId);
     this.continueTargets = normalizeContinueTargets(options.continueTargets);
@@ -661,16 +610,9 @@ class ArmedSeat {
       throw new Error(`\`muuuuse ${this.seatId}\` cannot link to itself.`);
     }
     this.sessionName = resolveSessionName(this.cwd, this.seatId);
-    if (!this.sessionName) {
-      throw new Error(
-        `No armed \`muuuuse ${this.partnerSeatId}\` seat is waiting in this cwd. Run \`muuuuse ${this.partnerSeatId}\` first.`
-      );
-    }
     this.sessionPaths = getSessionPaths(this.sessionName);
     this.paths = getSeatPaths(this.sessionName, this.seatId);
-    this.partnerPaths = getSeatPaths(this.sessionName, this.partnerSeatId);
     this.continueOffset = getFileSize(this.paths.continuePath);
-    this.partnerOffset = getFileSize(this.partnerPaths.eventsPath);
 
     this.child = null;
     this.childPid = null;
@@ -683,17 +625,11 @@ class ArmedSeat {
     this.stdinCleanup = null;
     this.resizeCleanup = null;
     this.forceKillTimer = null;
-    this.identity = null;
+    this.identity = loadOrCreateSeatIdentity(this.paths);
     this.lastUserInputAtMs = 0;
     this.pendingInboundContext = null;
     this.recentInboundRelays = [];
     this.recentEmittedAnswers = [];
-    this.trustState = {
-      challenge: null,
-      peerPublicKey: null,
-      phase: isAnchorSeat(this.seatId) ? "waiting_for_peer_signature" : "waiting_for_anchor_key",
-      pairedAt: null,
-    };
     this.liveState = {
       type: null,
       pid: null,
@@ -714,11 +650,7 @@ class ArmedSeat {
       cwd: this.cwd,
       createdAt: current.createdAt || this.startedAt,
       updatedAt: new Date().toISOString(),
-      anchorSeatId: this.anchorSeatId,
-      partnerSeatId: this.partnerSeatId,
-      anchorSeatPid: this.seatId === this.anchorSeatId ? process.pid : current.anchorSeatPid || null,
-      partnerSeatPid: this.seatId === this.partnerSeatId ? process.pid : current.partnerSeatPid || null,
-      pid: this.seatId === this.anchorSeatId ? process.pid : current.pid || null,
+      pid: process.pid,
       ...extra,
     });
   }
@@ -730,7 +662,6 @@ class ArmedSeat {
   writeMeta(extra = {}) {
     writeJson(this.paths.metaPath, {
       seatId: this.seatId,
-      partnerSeatId: this.partnerSeatId,
       sessionName: this.sessionName,
       flowMode: this.flowMode,
       continueSeatId: this.continueSeatId,
@@ -738,6 +669,7 @@ class ArmedSeat {
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
+      publicKey: this.identity?.publicKey || null,
       command: [resolveShell(), ...resolveShellArgs(resolveShell())],
       startedAt: this.startedAt,
       ...extra,
@@ -747,7 +679,6 @@ class ArmedSeat {
   writeStatus(extra = {}) {
     writeJson(this.paths.statusPath, {
       seatId: this.seatId,
-      partnerSeatId: this.partnerSeatId,
       sessionName: this.sessionName,
       flowMode: this.flowMode,
       continueSeatId: this.continueSeatId,
@@ -755,183 +686,17 @@ class ArmedSeat {
       cwd: this.cwd,
       pid: process.pid,
       childPid: this.childPid,
+      publicKey: this.identity?.publicKey || null,
       relayCount: this.relayCount,
       updatedAt: new Date().toISOString(),
       ...extra,
     });
   }
 
-  initializeTrustMaterial() {
-    this.identity = loadOrCreateSeatIdentity(this.paths);
-
-    if (!isAnchorSeat(this.seatId)) {
-      return;
-    }
-
-    writeJson(this.paths.challengePath, {
-      sessionName: this.sessionName,
-      challenge: createId(48),
-      publicKey: this.identity.publicKey,
-      createdAt: new Date().toISOString(),
-    });
-    this.trustState.challenge = readSeatChallenge(this.paths, this.sessionName)?.challenge || null;
-    this.trustState.peerPublicKey = null;
-    this.trustState.phase = "waiting_for_peer_signature";
-    this.trustState.pairedAt = null;
-    fs.rmSync(this.paths.ackPath, { force: true });
-    fs.rmSync(this.partnerPaths.claimPath, { force: true });
-  }
-
-  syncTrustState() {
-    if (!this.identity) {
-      this.initializeTrustMaterial();
-    }
-
-    if (isAnchorSeat(this.seatId)) {
-      this.syncSeatOneTrust();
-      return;
-    }
-
-    this.syncSeatTwoTrust();
-  }
-
-  syncSeatOneTrust() {
-    const challengeRecord = readSeatChallenge(this.paths, this.sessionName);
-    if (!challengeRecord || challengeRecord.publicKey !== this.identity.publicKey) {
-      this.trustState = {
-        challenge: null,
-        peerPublicKey: null,
-        phase: "waiting_for_peer_signature",
-        pairedAt: null,
-      };
-      return;
-    }
-
-    this.trustState.challenge = challengeRecord.challenge;
-    const claim = readJson(this.partnerPaths.claimPath, null);
-    if (
-      !claim ||
-      claim.sessionName !== this.sessionName ||
-      claim.challenge !== challengeRecord.challenge ||
-      typeof claim.publicKey !== "string" ||
-      typeof claim.signature !== "string" ||
-      !verifyText(
-        buildClaimMessage(
-          this.sessionName,
-          challengeRecord.challenge,
-          this.identity.publicKey,
-          claim.publicKey.trim()
-        ),
-        claim.signature,
-        claim.publicKey
-      )
-    ) {
-      this.trustState.peerPublicKey = null;
-      this.trustState.phase = "waiting_for_peer_signature";
-      this.trustState.pairedAt = null;
-      fs.rmSync(this.paths.ackPath, { force: true });
-      return;
-    }
-
-    const peerPublicKey = claim.publicKey.trim();
-    const ackMessage = buildAckMessage(this.sessionName, challengeRecord.challenge, this.identity.publicKey, peerPublicKey);
-    const currentAck = readJson(this.paths.ackPath, null);
-    const ackIsValid = Boolean(
-      currentAck &&
-      currentAck.sessionName === this.sessionName &&
-      currentAck.challenge === challengeRecord.challenge &&
-      currentAck.publicKey === this.identity.publicKey &&
-      currentAck.peerPublicKey === peerPublicKey &&
-      typeof currentAck.signature === "string" &&
-      verifyText(ackMessage, currentAck.signature, this.identity.publicKey)
-    );
-    if (!ackIsValid) {
-      writeJson(this.paths.ackPath, {
-        sessionName: this.sessionName,
-        challenge: challengeRecord.challenge,
-        publicKey: this.identity.publicKey,
-        peerPublicKey,
-        signature: signText(ackMessage, this.identity.privateKey),
-        signedAt: new Date().toISOString(),
-      });
-    }
-
-    const ackRecord = ackIsValid ? currentAck : readJson(this.paths.ackPath, null);
-    this.trustState.peerPublicKey = peerPublicKey;
-    this.trustState.phase = "paired";
-    this.trustState.pairedAt = ackRecord?.signedAt || new Date().toISOString();
-  }
-
-  syncSeatTwoTrust() {
-    const challengeRecord = readSeatChallenge(this.partnerPaths, this.sessionName);
-    if (!challengeRecord) {
-      this.trustState = {
-        challenge: null,
-        peerPublicKey: null,
-        phase: "waiting_for_anchor_key",
-        pairedAt: null,
-      };
-      return;
-    }
-
-    const challenge = challengeRecord.challenge;
-    const peerPublicKey = challengeRecord.publicKey;
-    const claimPayload = {
-      sessionName: this.sessionName,
-      challenge,
-      publicKey: this.identity.publicKey,
-    };
-    const claimSignature = signText(
-      buildClaimMessage(this.sessionName, challenge, peerPublicKey, this.identity.publicKey),
-      this.identity.privateKey
-    );
-    const currentClaim = readJson(this.paths.claimPath, null);
-    if (
-      !currentClaim ||
-      currentClaim.sessionName !== claimPayload.sessionName ||
-      currentClaim.challenge !== claimPayload.challenge ||
-      currentClaim.publicKey !== claimPayload.publicKey ||
-      currentClaim.signature !== claimSignature
-    ) {
-      writeJson(this.paths.claimPath, {
-        ...claimPayload,
-        signature: claimSignature,
-        signedAt: new Date().toISOString(),
-      });
-    }
-
-    const ack = readJson(this.partnerPaths.ackPath, null);
-    const paired = Boolean(
-      ack &&
-      ack.sessionName === this.sessionName &&
-      ack.challenge === challenge &&
-      ack.peerPublicKey === this.identity.publicKey &&
-      ack.publicKey === peerPublicKey &&
-      typeof ack.signature === "string" &&
-      verifyText(
-        buildAckMessage(this.sessionName, challenge, peerPublicKey, this.identity.publicKey),
-        ack.signature,
-        peerPublicKey
-      )
-    );
-
-    this.trustState.challenge = challenge;
-    this.trustState.peerPublicKey = peerPublicKey;
-    this.trustState.phase = paired ? "paired" : "waiting_for_pair_ack";
-    this.trustState.pairedAt = paired ? (ack.signedAt || new Date().toISOString()) : null;
-  }
-
-  isPaired() {
-    return this.trustState.phase === "paired" &&
-      typeof this.trustState.challenge === "string" &&
-      typeof this.trustState.peerPublicKey === "string";
-  }
-
   launchShell() {
     ensureDir(this.paths.dir);
     fs.rmSync(this.paths.pipePath, { force: true });
     clearStaleStopRequest(this.sessionPaths.stopPath, this.startedAtMs);
-    this.initializeTrustMaterial();
     this.writeController();
 
     const shell = resolveShell();
@@ -948,7 +713,7 @@ class ArmedSeat {
 
     this.childPid = this.child.pid;
     this.writeMeta();
-    this.writeStatus({ state: "running", trust: this.trustState.phase });
+    this.writeStatus({ state: "running" });
 
     this.child.onData((data) => {
       fs.appendFileSync(this.paths.pipePath, data);
@@ -1082,30 +847,19 @@ class ArmedSeat {
     }
   }
 
-  partnerIsLive() {
-    const partner = readJson(this.partnerPaths.statusPath, null);
-    return Boolean(partner?.pid && isPidAlive(partner.pid));
-  }
-
-  getLinkTarget(seatId) {
-    const desiredSeatId = normalizeContinueSeatId(seatId);
-    if (!desiredSeatId) {
-      return null;
+  getConfiguredTargets() {
+    const targets = [...this.continueTargets];
+    if (this.continueSeatId && !targets.some((target) => target.seatId === this.continueSeatId)) {
+      targets.push({
+        seatId: this.continueSeatId,
+        flowMode: this.flowMode,
+      });
     }
-
-    return this.continueTargets.find((target) => target.seatId === desiredSeatId) || null;
-  }
-
-  getPartnerLinkTarget() {
-    return this.getLinkTarget(this.partnerSeatId);
+    return targets;
   }
 
   shouldCaptureCommentary() {
-    if (this.flowMode === "on") {
-      return true;
-    }
-
-    return this.continueTargets.some((target) => target.flowMode === "on");
+    return this.getConfiguredTargets().some((target) => target.flowMode === "on");
   }
 
   stopRequested() {
@@ -1118,110 +872,80 @@ class ArmedSeat {
     return Number.isFinite(requestedAtMs) && requestedAtMs > this.startedAtMs;
   }
 
-  findContinuationTarget(targetSeatId = null) {
+  hasAuthorizedSource(sourceSeatId) {
+    const desiredSeatId = normalizeSeatId(sourceSeatId);
+    if (!desiredSeatId) {
+      return false;
+    }
+
+    return this.getConfiguredTargets().some((target) => target.seatId === desiredSeatId);
+  }
+
+  readSourcePublicKey(sourceSeatId) {
+    const desiredSeatId = normalizeSeatId(sourceSeatId);
+    if (!desiredSeatId) {
+      return null;
+    }
+
+    const sourcePaths = getSeatPaths(this.sessionName, desiredSeatId);
+    const sourceMeta = readJson(sourcePaths.metaPath, null);
+    if (typeof sourceMeta?.publicKey === "string" && sourceMeta.publicKey.trim()) {
+      return sourceMeta.publicKey.trim();
+    }
+
+    try {
+      const key = fs.readFileSync(sourcePaths.publicKeyPath, "utf8").trim();
+      return key || null;
+    } catch {
+      return null;
+    }
+  }
+
+  findLinkedTarget(targetSeatId) {
     const desiredSeatId = normalizeContinueSeatId(targetSeatId);
     if (!desiredSeatId) {
       return null;
     }
 
-    const candidates = listSessionNames()
-      .map((sessionName) => {
-        if (!getSeatDirIfExists(sessionName, desiredSeatId)) {
-          return null;
-        }
-
-        const seat = buildSeatReport(sessionName, desiredSeatId);
-        if (!seat || !matchesWorkingPath(seat.cwd, this.cwd)) {
-          return null;
-        }
-
-        const updatedAtMs = Date.parse(seat.updatedAt || seat.startedAt || "");
-        return {
-          seat,
-          sessionName,
-          updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : 0,
-        };
-      })
-      .filter((entry) => entry !== null)
-      .sort((left, right) => right.updatedAtMs - left.updatedAtMs);
-
-    if (candidates.length === 0) {
+    const seat = buildSeatReport(this.sessionName, desiredSeatId);
+    if (!seat || !matchesWorkingPath(seat.cwd, this.cwd)) {
       return null;
     }
 
-    const target = candidates[0];
     return {
-      seatId: target.seat.seatId,
-      sessionName: target.sessionName,
-      paths: getSeatPaths(target.sessionName, target.seat.seatId),
+      seatId: seat.seatId,
+      paths: getSeatPaths(this.sessionName, seat.seatId),
     };
   }
 
-  async pullPartnerEvents() {
-    const { nextOffset, text } = readAppendedText(this.partnerPaths.eventsPath, this.partnerOffset);
-    this.partnerOffset = nextOffset;
-    if (!text.trim() || !this.child || this.stopped || !this.isPaired()) {
-      return;
+  verifyInboundEntry(entry) {
+    const sourceSeatId = normalizeSeatId(entry?.sourceSeatId || entry?.seatId);
+    const targetSeatId = normalizeSeatId(entry?.targetSeatId);
+    const payload = sanitizeRelayText(entry?.text);
+    if (!sourceSeatId || targetSeatId !== this.seatId || !payload || !this.hasAuthorizedSource(sourceSeatId)) {
+      return false;
     }
 
-    const entries = parseAnswerEntries(text);
-    for (const entry of entries) {
-      if (this.stopped || this.stopRequested()) {
-        this.requestStop("stop_requested");
-        return;
-      }
+    const publicKey = this.readSourcePublicKey(sourceSeatId);
+    if (!publicKey || entry.publicKey !== publicKey || typeof entry.signature !== "string") {
+      return false;
+    }
 
-      if (!shouldAcceptInboundEntry(resolveInboundFlowMode(this.flowMode, this.seatId, entry), entry)) {
-        continue;
-      }
-
-      const payload = sanitizeRelayText(entry.text);
-      const signaturePayload = buildAnswerSignaturePayload(this.sessionName, this.trustState.challenge, {
+    return verifyText(
+      buildAnswerSignaturePayload(this.sessionName, null, {
+        id: entry.id,
+        sourceSeatId,
+        targetSeatId,
         chainId: entry.chainId || entry.id,
         hop: Number.isInteger(entry.hop) ? entry.hop : 0,
-        id: entry.id,
-        seatId: entry.seatId,
         origin: entry.origin || "unknown",
         phase: getRelayPhase(entry),
         createdAt: entry.createdAt,
         text: payload,
-      });
-      if (
-        !payload ||
-        entry.challenge !== this.trustState.challenge ||
-        entry.publicKey !== this.trustState.peerPublicKey ||
-        typeof entry.signature !== "string" ||
-        !verifyText(signaturePayload, entry.signature, this.trustState.peerPublicKey)
-      ) {
-        continue;
-      }
-
-      const delivered = await sendTextAndEnter(
-        this.child,
-        payload,
-        () => this.stopped || this.stopRequested() || !this.child || Boolean(this.childExit)
-      );
-      if (!delivered) {
-        this.requestStop("relay_aborted");
-        return;
-      }
-
-      if (this.stopped || this.stopRequested()) {
-        this.requestStop("stop_requested");
-        return;
-      }
-
-      const deliveredAtMs = Date.now();
-      this.pendingInboundContext = {
-        chainId: entry.chainId || entry.id,
-        deliveredAtMs,
-        expiresAtMs: deliveredAtMs + PENDING_RELAY_CONTEXT_TTL_MS,
-        hop: Number.isInteger(entry.hop) ? entry.hop : 0,
-      };
-      this.relayCount += 1;
-      this.rememberInboundRelay(payload);
-      this.log(`[${this.partnerSeatId} -> ${this.seatId}] ${previewText(payload)}`);
-    }
+      }),
+      entry.signature,
+      publicKey
+    );
   }
 
   async pullContinuationEvents() {
@@ -1238,7 +962,7 @@ class ArmedSeat {
         return;
       }
 
-      if (!shouldAcceptInboundEntry(resolveInboundFlowMode(this.flowMode, this.seatId, entry), entry)) {
+      if (!this.verifyInboundEntry(entry)) {
         continue;
       }
 
@@ -1529,6 +1253,7 @@ class ArmedSeat {
       id: entryId,
       type: "answer",
       seatId: this.seatId,
+      sourceSeatId: this.seatId,
       origin: entry.origin || "unknown",
       phase: entry.phase || "final_answer",
       text: payload,
@@ -1537,64 +1262,40 @@ class ArmedSeat {
       hop: pendingInboundContext ? pendingInboundContext.hop + 1 : 0,
     };
 
-    const partnerLinkTarget = this.getPartnerLinkTarget();
-    let outboundEntry = relayEntry;
-    if (this.isPaired() && this.identity) {
-      const signedEntry = {
-        ...relayEntry,
-        challenge: this.trustState.challenge,
-        publicKey: this.identity.publicKey,
-        targetSeatId: partnerLinkTarget?.seatId || null,
-        targetFlowMode: partnerLinkTarget?.flowMode || null,
-      };
-      signedEntry.signature = signText(
-        buildAnswerSignaturePayload(this.sessionName, this.trustState.challenge, signedEntry),
-        this.identity.privateKey
-      );
-
-      if (!partnerLinkTarget) {
-        appendJsonl(this.paths.eventsPath, signedEntry);
-      }
-      outboundEntry = signedEntry;
-    }
-
-    if (this.continueSeatId || this.continueTargets.length > 0) {
-      this.forwardContinuation(outboundEntry);
-    }
+    appendJsonl(this.paths.eventsPath, relayEntry);
+    this.forwardContinuation(relayEntry);
     this.rememberEmittedAnswer(answerKey);
 
     this.log(`[${this.seatId}] ${previewText(payload)}`);
   }
 
-  forwardContinuation(signedEntry) {
-    const targets = [...this.continueTargets];
-    if (this.continueSeatId && !targets.some((target) => target.seatId === this.continueSeatId)) {
-      targets.push({
-        seatId: this.continueSeatId,
-        flowMode: null,
-      });
-    }
-
+  forwardContinuation(relayEntry) {
+    const targets = this.getConfiguredTargets();
     if (targets.length === 0) {
       return;
     }
 
     for (const targetEntry of targets) {
-      if (targetEntry.flowMode && !shouldAcceptInboundEntry(targetEntry.flowMode, signedEntry)) {
+      if (!shouldAcceptInboundEntry(targetEntry.flowMode, relayEntry)) {
         continue;
       }
 
-      const target = this.findContinuationTarget(targetEntry.seatId);
+      const target = this.findLinkedTarget(targetEntry.seatId);
       if (!target) {
-        this.log(`[${this.seatId}] continue ${targetEntry.seatId} unavailable`);
+        this.log(`[${this.seatId}] link ${targetEntry.seatId} unavailable`);
         continue;
       }
 
       const continuationEntry = buildContinuationEntry(
         this.sessionName,
         target.seatId,
-        signedEntry,
+        relayEntry,
         targetEntry.flowMode
+      );
+      continuationEntry.publicKey = this.identity.publicKey;
+      continuationEntry.signature = signText(
+        buildAnswerSignaturePayload(this.sessionName, null, continuationEntry),
+        this.identity.privateKey
       );
       appendJsonl(target.paths.continuePath, continuationEntry);
       this.log(`[${this.seatId} => ${target.seatId}] ${previewText(continuationEntry.text)}`);
@@ -1603,17 +1304,11 @@ class ArmedSeat {
 
   async tick() {
     if (this.stopRequested()) {
-      this.writeStatus({
-        state: "stopping",
-        partnerLive: this.partnerIsLive(),
-        trust: this.trustState.phase,
-      });
+      this.writeStatus({ state: "stopping" });
       this.requestStop("stop_requested");
       return;
     }
 
-    this.syncTrustState();
-    await this.pullPartnerEvents();
     await this.pullContinuationEvents();
     if (this.stopped || this.stopRequested()) {
       this.requestStop("stop_requested");
@@ -1632,9 +1327,6 @@ class ArmedSeat {
       cwd: live.cwd,
       log: live.log,
       lastAnswerAt: live.lastAnswerAt,
-      partnerLive: this.partnerIsLive(),
-      trust: this.trustState.phase,
-      challengeReady: Boolean(this.trustState.challenge),
     });
   }
 
@@ -1646,24 +1338,17 @@ class ArmedSeat {
 
     this.log(`${BRAND} seat ${this.seatId} armed for ${this.sessionName}.`);
     this.log("Use this shell normally. Codex, Claude, and Gemini relay automatically from their local session logs.");
-    this.log(`Seat ${this.seatId} relay mode is flow ${this.flowMode}.`);
+    this.log(`Seat ${this.seatId} default relay mode is flow ${this.flowMode}.`);
     if (this.continueSeatId) {
       this.log(`Seat ${this.seatId} continues to seat ${this.continueSeatId}.`);
     }
-    if (this.continueTargets.length > 0) {
+    const configuredTargets = this.getConfiguredTargets();
+    if (configuredTargets.length > 0) {
       this.log(
-        `Seat ${this.seatId} links additional targets: ${this.continueTargets.map((target) => `${target.seatId}:${target.flowMode}`).join(", ")}.`
+        `Seat ${this.seatId} links signed relay targets: ${configuredTargets.map((target) => `${target.seatId}:${target.flowMode}`).join(", ")}.`
       );
     }
-    if (this.partnerIsLive()) {
-      if (isAnchorSeat(this.seatId)) {
-        this.log(`Seat ${this.seatId} generated the session key and is waiting for seat ${this.partnerSeatId} to sign it.`);
-      } else {
-        this.log(`Seat ${this.seatId} will sign the session key from seat ${this.partnerSeatId}, then relay goes live.`);
-      }
-    } else {
-      this.log(`Seat ${this.seatId} is armed without a live pair partner. Link targets can relay immediately; direct pair relay activates after seat ${this.partnerSeatId} joins.`);
-    }
+    this.log("Signed relays are accepted only from seats that this seat links back to.");
     this.log("Run `muuuuse status` or `muuuuse stop` from any terminal.");
 
     try {
@@ -1772,10 +1457,8 @@ function buildSeatReport(sessionName, seatId) {
     relayCount: status?.relayCount || 0,
     log: status?.log || null,
     startedAt: meta?.startedAt || null,
-    trust: status?.trust || null,
     updatedAt: status?.updatedAt || null,
     lastAnswerAt: status?.lastAnswerAt || null,
-    partnerLive: Boolean(status?.partnerLive),
   };
 }
 
