@@ -21,9 +21,11 @@ const {
 const {
   buildChildEnv,
   chunkRelayPayloadForTyping,
+  ensureSeatGeminiCliHome,
   isBareEscapeInput,
   isMeaningfulTerminalInput,
   normalizeRelayPayloadForTyping,
+  sendTextAndEnter,
 } = require("../src/runtime");
 
 const binPath = path.join(__dirname, "..", "bin", "muuse.js");
@@ -42,6 +44,11 @@ async function main() {
   testLateAttachFiltering();
   testSessionCandidateSelection();
   testChildEnvScrubsOuterCodexState();
+  testChildEnvLoadsGeminiApiKeyFromHomeFile();
+  testChildEnvPreservesExplicitGeminiApiKey();
+  testChildEnvIsolatesGeminiCliHomes();
+  testGeminiSeatHomeSessionSelection();
+  await testCodexRelayUsesBracketedPaste();
   testTerminalInputFiltering();
   testRelayTypingChunks();
   testAgentDetection();
@@ -383,6 +390,183 @@ function testChildEnvScrubsOuterCodexState() {
   assert.equal(childEnv.TERM, "screen-256color");
   assert.equal(childEnv.HOME, "/tmp/demo-home");
   assert.equal(childEnv.PATH, ["/usr/local/bin", "/usr/bin"].join(path.delimiter));
+  const projectLabel = `demo-project-${createHash("sha1").update("/tmp/demo-project").digest("hex").slice(0, 8)}`;
+  assert.equal(
+    childEnv.GEMINI_CLI_HOME,
+    path.join("/tmp/demo-home", ".muuuuse", "gemini-cli-homes", projectLabel, "seat-2")
+  );
+}
+
+function testChildEnvLoadsGeminiApiKeyFromHomeFile() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-key-home-"));
+  fs.writeFileSync(path.join(home, "gemini.txt"), "home-file-key\n");
+
+  try {
+    const childEnv = buildChildEnv(1, "demo-session", "/tmp/demo-project", {
+      HOME: home,
+      PATH: "/usr/bin",
+    });
+
+    assert.equal(childEnv.GEMINI_API_KEY, "home-file-key");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+function testChildEnvPreservesExplicitGeminiApiKey() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-explicit-home-"));
+  fs.writeFileSync(path.join(home, "gemini.txt"), "home-file-key\n");
+
+  try {
+    const childEnv = buildChildEnv(1, "demo-session", "/tmp/demo-project", {
+      HOME: home,
+      PATH: "/usr/bin",
+      GEMINI_API_KEY: "exported-key",
+    });
+
+    assert.equal(childEnv.GEMINI_API_KEY, "exported-key");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+function testChildEnvIsolatesGeminiCliHomes() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-home-"));
+  const sharedGeminiDir = path.join(home, ".gemini");
+  fs.mkdirSync(path.join(sharedGeminiDir, "extensions"), { recursive: true });
+  fs.mkdirSync(path.join(sharedGeminiDir, "tmp"), { recursive: true });
+  fs.writeFileSync(path.join(sharedGeminiDir, "gemini-credentials.json"), "{\"auth\":true}\n");
+  fs.writeFileSync(path.join(sharedGeminiDir, "settings.json"), "{\"security\":{\"auth\":{\"selectedType\":\"gemini-api-key\"}}}\n");
+  fs.writeFileSync(path.join(sharedGeminiDir, "trustedFolders.json"), "{\"/root\":\"TRUST_FOLDER\"}\n");
+  fs.writeFileSync(path.join(sharedGeminiDir, "extensions", "theme.txt"), "signal\n");
+  fs.writeFileSync(path.join(sharedGeminiDir, "tmp", "shared.txt"), "shared\n");
+
+  try {
+    const envSeat2 = buildChildEnv(2, "demo-session", "/tmp/demo-project", {
+      HOME: home,
+      PATH: "/usr/bin",
+    });
+    const envSeat3 = buildChildEnv(3, "demo-session", "/tmp/demo-project", {
+      HOME: home,
+      PATH: "/usr/bin",
+    });
+
+    assert.notEqual(envSeat2.GEMINI_CLI_HOME, envSeat3.GEMINI_CLI_HOME);
+
+    ensureSeatGeminiCliHome(home, "/tmp/demo-project", 2, { HOME: home });
+    const seatGeminiDir = path.join(envSeat2.GEMINI_CLI_HOME, ".gemini");
+    assert.equal(
+      fs.readFileSync(path.join(seatGeminiDir, "gemini-credentials.json"), "utf8"),
+      "{\"auth\":true}\n"
+    );
+    assert.equal(
+      fs.readFileSync(path.join(seatGeminiDir, "extensions", "theme.txt"), "utf8"),
+      "signal\n"
+    );
+    assert.equal(fs.existsSync(path.join(seatGeminiDir, "tmp", "shared.txt")), false);
+    assert.equal(
+      fs.readFileSync(path.join(seatGeminiDir, "settings.json"), "utf8"),
+      "{\"security\":{\"auth\":{\"selectedType\":\"gemini-api-key\"}}}\n"
+    );
+    assert.equal(
+      fs.readFileSync(path.join(seatGeminiDir, "trustedFolders.json"), "utf8"),
+      "{\"/root\":\"TRUST_FOLDER\"}\n"
+    );
+
+    fs.writeFileSync(path.join(seatGeminiDir, "tmp", "seat-only.txt"), "seat\n");
+    assert.equal(fs.existsSync(path.join(sharedGeminiDir, "tmp", "seat-only.txt")), false);
+    fs.writeFileSync(path.join(seatGeminiDir, "settings.json"), "{\"security\":{\"auth\":{\"selectedType\":\"oauth-personal\"}}}\n");
+    assert.equal(
+      fs.readFileSync(path.join(sharedGeminiDir, "settings.json"), "utf8"),
+      "{\"security\":{\"auth\":{\"selectedType\":\"gemini-api-key\"}}}\n"
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+function testGeminiSeatHomeSessionSelection() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-select-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-select-cwd-"));
+  const projectHash = createHash("sha256").update(cwd).digest("hex");
+  const processStartedAtMs = Date.parse("2026-03-20T19:00:00.000Z");
+
+  try {
+    const seat2Env = buildChildEnv(2, "demo-session", cwd, {
+      HOME: home,
+      PATH: "/usr/bin",
+    });
+    const seat3Env = buildChildEnv(3, "demo-session", cwd, {
+      HOME: home,
+      PATH: "/usr/bin",
+    });
+
+    const seat2File = path.join(seat2Env.GEMINI_CLI_HOME, ".gemini", "tmp", "seat-two", "chats", "session-seat2.json");
+    const seat3File = path.join(seat3Env.GEMINI_CLI_HOME, ".gemini", "tmp", "seat-three", "chats", "session-seat3.json");
+
+    for (const [filePath, startTime] of [
+      [seat2File, "2026-03-20T19:00:01.000Z"],
+      [seat3File, "2026-03-20T19:00:02.000Z"],
+    ]) {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, JSON.stringify({
+        projectHash,
+        startTime,
+        lastUpdated: startTime,
+        messages: [],
+      }));
+    }
+
+    const seat2Selected = execFileSync(process.execPath, [
+      "-e",
+      `
+        const { selectGeminiSessionFile } = require(${JSON.stringify(path.join(__dirname, "..", "src", "agents.js"))});
+        const selected = selectGeminiSessionFile(
+          ${JSON.stringify(cwd)},
+          ${processStartedAtMs},
+          { seatId: 2 }
+        );
+        process.stdout.write(selected || "");
+      `,
+    ], {
+      encoding: "utf8",
+      env: buildEnv(home),
+    }).trim();
+
+    const seat3Selected = execFileSync(process.execPath, [
+      "-e",
+      `
+        const { selectGeminiSessionFile } = require(${JSON.stringify(path.join(__dirname, "..", "src", "agents.js"))});
+        const selected = selectGeminiSessionFile(
+          ${JSON.stringify(cwd)},
+          ${processStartedAtMs},
+          { seatId: 3 }
+        );
+        process.stdout.write(selected || "");
+      `,
+    ], {
+      encoding: "utf8",
+      env: buildEnv(home),
+    }).trim();
+
+    assert.equal(seat2Selected, seat2File);
+    assert.equal(seat3Selected, seat3File);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+async function testCodexRelayUsesBracketedPaste() {
+  const writes = [];
+  const delivered = await sendTextAndEnter({
+    write(value) {
+      writes.push(value);
+    },
+  }, "FOLLOWUP-CODEX", { agentType: "codex" });
+
+  assert.equal(delivered, true);
+  assert.deepEqual(writes, ["\u001b[200~FOLLOWUP-CODEX\u001b[201~", "\r"]);
 }
 
 function testTerminalInputFiltering() {

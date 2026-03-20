@@ -20,6 +20,7 @@ const {
   ensureDir,
   getDefaultSessionName,
   getFileSize,
+  getSeatGeminiCliHome,
   getSeatPaths,
   getSessionPaths,
   getStateRoot,
@@ -41,6 +42,14 @@ const {
 // A short settle delay keeps interactive CLIs from treating submit as another newline.
 const TYPE_CHUNK_DELAY_MS = 45;
 const TYPE_CHUNK_SIZE = 24;
+const BRACKETED_PASTE_START = "\u001b[200~";
+const BRACKETED_PASTE_END = "\u001b[201~";
+const GEMINI_SHARED_ENTRY_NAMES = new Set([
+  "gemini-credentials.json",
+  "google_accounts.json",
+  "installation_id",
+  "mcp-oauth-tokens-v2.json",
+]);
 const MIRROR_SUPPRESSION_WINDOW_MS = 30 * 1000;
 const PENDING_RELAY_CONTEXT_TTL_MS = 2 * 60 * 1000;
 const EMITTED_ANSWER_TTL_MS = 5 * 60 * 1000;
@@ -144,6 +153,78 @@ function sanitizeChildPath(pathValue, homeDir) {
   return entries.join(path.delimiter);
 }
 
+function readGeminiApiKeyFromHome(homeDir) {
+  const filePath = path.join(homeDir, "gemini.txt");
+  try {
+    const value = fs.readFileSync(filePath, "utf8").trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
+function syncGeminiCliHomeEntry(sourcePath, targetPath) {
+  const shouldLink = GEMINI_SHARED_ENTRY_NAMES.has(path.basename(sourcePath));
+  try {
+    if (fs.lstatSync(targetPath).isSymbolicLink() && fs.realpathSync(targetPath) === sourcePath) {
+      return;
+    }
+  } catch {
+    // Recreate the target entry below when missing or mismatched.
+  }
+
+  fs.rmSync(targetPath, { recursive: true, force: true });
+
+  const sourceStats = fs.lstatSync(sourcePath);
+  if (shouldLink) {
+    try {
+      const linkType = process.platform === "win32"
+        ? (sourceStats.isDirectory() ? "junction" : "file")
+        : undefined;
+      fs.symlinkSync(sourcePath, targetPath, linkType);
+      return;
+    } catch {
+      // Fall through to copying when symlinks are unavailable.
+    }
+  }
+
+  if (sourceStats.isDirectory()) {
+    fs.cpSync(sourcePath, targetPath, { recursive: true });
+    return;
+  }
+
+  fs.copyFileSync(sourcePath, targetPath);
+}
+
+function ensureSeatGeminiCliHome(homeDir, cwd, seatId, baseEnv = process.env) {
+  const sourceHomeRoot = String(baseEnv.GEMINI_CLI_HOME || homeDir).trim() || homeDir;
+  const sourceGeminiDir = path.join(sourceHomeRoot, ".gemini");
+  const targetHomeRoot = getSeatGeminiCliHome(homeDir, cwd, seatId);
+  const targetGeminiDir = ensureDir(path.join(targetHomeRoot, ".gemini"));
+
+  let sourceEntries = [];
+  try {
+    sourceEntries = fs.readdirSync(sourceGeminiDir, { withFileTypes: true });
+  } catch {
+    ensureDir(path.join(targetGeminiDir, "tmp"));
+    return targetHomeRoot;
+  }
+
+  for (const entry of sourceEntries) {
+    if (entry.name === "tmp") {
+      continue;
+    }
+
+    syncGeminiCliHomeEntry(
+      path.join(sourceGeminiDir, entry.name),
+      path.join(targetGeminiDir, entry.name)
+    );
+  }
+
+  ensureDir(path.join(targetGeminiDir, "tmp"));
+  return targetHomeRoot;
+}
+
 function buildChildEnv(seatId, sessionName, cwd, baseEnv = process.env) {
   const env = { ...baseEnv };
   for (const key of CHILD_ENV_DROP_KEYS) {
@@ -156,6 +237,13 @@ function buildChildEnv(seatId, sessionName, cwd, baseEnv = process.env) {
   env.TERM = resolveChildTerm(baseEnv);
   env.MUUUUSE_SEAT = String(seatId);
   env.MUUUUSE_SESSION = sessionName;
+  if (!String(env.GEMINI_API_KEY || "").trim()) {
+    const homeGeminiApiKey = readGeminiApiKeyFromHome(homeDir);
+    if (homeGeminiApiKey) {
+      env.GEMINI_API_KEY = homeGeminiApiKey;
+    }
+  }
+  env.GEMINI_CLI_HOME = getSeatGeminiCliHome(homeDir, cwd, seatId);
   return env;
 }
 
@@ -566,24 +654,39 @@ function isMeaningfulTerminalInput(input) {
 }
 
 async function sendTextAndEnter(child, text, shouldAbort = () => false) {
+  const options = typeof shouldAbort === "function" ? { shouldAbort } : (shouldAbort || {});
+  const shouldStop = typeof options.shouldAbort === "function" ? options.shouldAbort : () => false;
+  const agentType = String(options.agentType || "").trim().toLowerCase() || null;
   const payload = normalizeRelayPayloadForTyping(text);
 
   if (payload.length > 0) {
-    for (const chunk of chunkRelayPayloadForTyping(payload)) {
-      if (shouldAbort() || !child) {
+    if (agentType === "codex") {
+      if (shouldStop() || !child) {
         return false;
       }
 
       try {
-        child.write(chunk);
+        child.write(`${BRACKETED_PASTE_START}${payload}${BRACKETED_PASTE_END}`);
       } catch {
         return false;
       }
-      await sleep(TYPE_CHUNK_DELAY_MS);
+    } else {
+      for (const chunk of chunkRelayPayloadForTyping(payload)) {
+        if (shouldStop() || !child) {
+          return false;
+        }
+
+        try {
+          child.write(chunk);
+        } catch {
+          return false;
+        }
+        await sleep(TYPE_CHUNK_DELAY_MS);
+      }
     }
   }
 
-  if (shouldAbort() || !child) {
+  if (shouldStop() || !child) {
     return false;
   }
 
@@ -702,6 +805,12 @@ class ArmedSeat {
     const shell = resolveShell();
     const shellArgs = resolveShellArgs(shell);
     const childEnv = buildChildEnv(this.seatId, this.sessionName, this.cwd);
+    ensureSeatGeminiCliHome(
+      String(childEnv.HOME || "").trim() || process.env.HOME || "/root",
+      this.cwd,
+      this.seatId,
+      process.env
+    );
     this.child = pty.spawn(shell, shellArgs, {
       cols: process.stdout.columns || 120,
       rows: process.stdout.rows || 36,
@@ -975,6 +1084,10 @@ class ArmedSeat {
       return;
     }
 
+    const detectedRelayAgent = this.liveState.type
+      ? { type: this.liveState.type }
+      : detectAgent(getChildProcesses(this.childPid));
+
     const entries = parseContinueEntries(text, this.seatId);
     for (const entry of entries) {
       if (this.stopped || this.stopRequested()) {
@@ -994,7 +1107,10 @@ class ArmedSeat {
       const delivered = await sendTextAndEnter(
         this.child,
         payload,
-        () => this.stopped || this.stopRequested() || !this.child || Boolean(this.childExit)
+        {
+          agentType: detectedRelayAgent?.type || null,
+          shouldAbort: () => this.stopped || this.stopRequested() || !this.child || Boolean(this.childExit),
+        }
       );
       if (!delivered) {
         this.requestStop("relay_aborted");
@@ -1551,12 +1667,14 @@ function stopAllSessions() {
 module.exports = {
   ArmedSeat,
   buildChildEnv,
+  ensureSeatGeminiCliHome,
   chunkRelayPayloadForTyping,
   getStatusReport,
   isBareEscapeInput,
   isMeaningfulTerminalInput,
   normalizeRelayPayloadForTyping,
   resolveSessionName,
+  sendTextAndEnter,
   stopAllSessions,
 };
 

@@ -1,6 +1,6 @@
 {
   "name": "muuuuse",
-  "version": "3.3.2",
+  "version": "3.3.3",
   "description": "🔌Muuuuse arms regular terminals and relays assistant output across signed terminal links.",
   "type": "commonjs",
   "bin": {

@@ -154,6 +154,16 @@ function getDefaultSessionName(currentPath = process.cwd()) {
   return `${label}-${hashText(resolvedPath).slice(0, 8)}`;
 }
 
+function getSeatGeminiCliHome(homeDir = os.homedir(), currentPath = process.cwd(), seatId) {
+  return path.join(
+    homeDir,
+    ".muuuuse",
+    "gemini-cli-homes",
+    getDefaultSessionName(currentPath),
+    `seat-${seatId}`
+  );
+}
+
 function getSessionDir(sessionName) {
   return ensureDir(path.join(getStateRoot(), "sessions", slugifySegment(sessionName)));
 }
@@ -315,6 +325,7 @@ module.exports = {
   ensureDir,
   getDefaultSessionName,
   getFileSize,
+  getSeatGeminiCliHome,
   loadOrCreateSeatIdentity,
   getSeatPaths,
   getSessionPaths,

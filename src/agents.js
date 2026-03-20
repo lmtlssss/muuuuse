@@ -5,6 +5,7 @@ const path = require("node:path");
 
 const {
   getFileSize,
+  getSeatGeminiCliHome,
   hashText,
   readAppendedText,
   sanitizeRelayText,
@@ -17,6 +18,23 @@ const CLAUDE_ROOT = path.join(os.homedir(), ".claude", "projects");
 const GEMINI_ROOT = path.join(os.homedir(), ".gemini", "tmp");
 const SESSION_START_EARLY_TOLERANCE_MS = 2 * 1000;
 const STRICT_SINGLE_CANDIDATE_EARLY_TOLERANCE_MS = 250;
+
+function uniquePaths(paths) {
+  return [...new Set(paths.map((entry) => path.resolve(entry)))];
+}
+
+function getGeminiRoots(currentPath, options = {}) {
+  const roots = [GEMINI_ROOT];
+  const seatId = Number.parseInt(String(options.seatId || "").trim(), 10);
+  if (Number.isInteger(seatId) && seatId > 0) {
+    roots.unshift(path.join(
+      getSeatGeminiCliHome(os.homedir(), currentPath, seatId),
+      ".gemini",
+      "tmp"
+    ));
+  }
+  return uniquePaths(roots);
+}
 
 function walkFiles(rootPath, predicate, results = []) {
   try {
@@ -642,14 +660,17 @@ function readGeminiCandidate(filePath) {
 
 function selectGeminiSessionFile(currentPath, processStartedAtMs, options = {}) {
   const projectHash = createHash("sha256").update(currentPath).digest("hex");
-  const liveCandidates = readOpenSessionCandidates(options.pids ?? options.pid, GEMINI_ROOT, readGeminiCandidate)
+  const geminiRoots = getGeminiRoots(currentPath, options);
+  const liveCandidates = geminiRoots
+    .flatMap((rootPath) => readOpenSessionCandidates(options.pids ?? options.pid, rootPath, readGeminiCandidate))
     .filter((candidate) => candidate.projectHash === projectHash);
   const livePath = selectLiveSessionCandidatePath(liveCandidates, projectHash, options.captureSinceMs);
   if (livePath) {
     return livePath;
   }
 
-  const candidates = walkFiles(GEMINI_ROOT, (filePath) => filePath.endsWith(".json"))
+  const candidates = geminiRoots
+    .flatMap((rootPath) => walkFiles(rootPath, (filePath) => filePath.endsWith(".json")))
     .map((filePath) => readGeminiCandidate(filePath))
     .filter((candidate) => candidate !== null && candidate.projectHash === projectHash);
 
