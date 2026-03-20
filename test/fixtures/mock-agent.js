@@ -8,9 +8,14 @@ const readline = require("node:readline");
 
 const agentType = String(process.argv[2] || "codex").trim().toLowerCase();
 const startedAt = new Date().toISOString();
+const sessionStartedAt = String(process.env.MOCK_SESSION_STARTED_AT || "").trim() || startedAt;
 const cwd = process.cwd();
 const replyMode = String(process.env.MOCK_REPLY_MODE || "prefix").trim().toLowerCase();
 const forcedReplyText = decodeMockText(String(process.env.MOCK_REPLY_TEXT || "").trim());
+const preloadReplyText = decodeMockText(String(process.env.MOCK_PRELOAD_REPLY || "").trim());
+const preloadReplyAt = String(process.env.MOCK_PRELOAD_REPLY_AT || "").trim() || sessionStartedAt;
+const codexSessionId = String(process.env.MOCK_CODEX_SESSION_ID || "").trim();
+const writeSnapshotClaim = String(process.env.MOCK_WRITE_SNAPSHOT_CLAIM || "").trim() === "1";
 const replyDelayMs = Math.max(0, Number.parseInt(process.env.MOCK_REPLY_DELAY_MS || "120", 10) || 120);
 const replySequence = String(process.env.MOCK_REPLY_SEQUENCE || "")
   .split("|")
@@ -19,7 +24,13 @@ const replySequence = String(process.env.MOCK_REPLY_SEQUENCE || "")
 let turn = 0;
 const keepaliveFds = [];
 
-const sessionFile = initializeSessionFile(agentType, cwd, startedAt);
+const sessionFile = initializeSessionFile(agentType, cwd, sessionStartedAt);
+if (agentType === "codex" && writeSnapshotClaim && codexSessionId) {
+  writeCodexSnapshotClaim(codexSessionId);
+}
+if (preloadReplyText) {
+  appendAnswer(agentType, sessionFile, preloadReplyText, preloadReplyAt);
+}
 process.stdout.write(`${agentType}-ready\n`);
 
 const rl = readline.createInterface({
@@ -86,6 +97,7 @@ function initializeSessionFile(type, currentPath, timestamp) {
     fs.writeFileSync(filePath, `${JSON.stringify({
       type: "session_meta",
       payload: {
+        id: codexSessionId || undefined,
         cwd: currentPath,
         timestamp,
       },
@@ -120,8 +132,23 @@ function initializeSessionFile(type, currentPath, timestamp) {
   return filePath;
 }
 
-function appendAnswer(type, filePath, reply) {
-  const timestamp = new Date().toISOString();
+function writeCodexSnapshotClaim(sessionId) {
+  const seatId = String(process.env.MUUUUSE_SEAT || "").trim();
+  const sessionName = String(process.env.MUUUUSE_SESSION || "").trim();
+  if (!seatId || !sessionName) {
+    return;
+  }
+
+  const snapshotDir = path.join(os.homedir(), ".codex", "shell_snapshots");
+  fs.mkdirSync(snapshotDir, { recursive: true });
+  fs.writeFileSync(path.join(snapshotDir, `${sessionId}.sh`), [
+    `declare -x MUUUUSE_SEAT="${seatId}"`,
+    `declare -x MUUUUSE_SESSION="${sessionName}"`,
+    "",
+  ].join("\n"));
+}
+
+function appendAnswer(type, filePath, reply, timestamp = new Date().toISOString()) {
 
   if (type === "codex") {
     fs.appendFileSync(filePath, `${JSON.stringify({

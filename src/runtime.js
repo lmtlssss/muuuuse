@@ -1295,7 +1295,10 @@ class ArmedSeat {
       this.liveState.lastMessageId = null;
       const sessionStartedAtMs = readSessionFileStartedAtMs(detectedAgent.type, resolvedSessionFile);
       if (Number.isFinite(sessionStartedAtMs)) {
-        this.liveState.captureSinceMs = Math.min(this.liveState.captureSinceMs, sessionStartedAtMs);
+        this.liveState.captureSinceMs = Math.max(
+          this.startedAtMs,
+          Math.min(this.liveState.captureSinceMs, sessionStartedAtMs)
+        );
       }
     }
 

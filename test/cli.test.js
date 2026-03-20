@@ -64,6 +64,7 @@ async function main() {
   await testAlternatingRepliesContinueUntilStopped();
   await testMixedFlowModesAllowContinuedReplies();
   await testQueuedRepliesAfterInboundAreRelayed();
+  await testLateAttachedSessionSkipsHistoricalRelayReplay();
   await testMultilineRelaySubmitsOnce();
   await testPassiveTerminalReportsDoNotClearRelayContext();
   await testBareEscapeDoesNotClearRelayContext();
@@ -1038,6 +1039,52 @@ async function testQueuedRepliesAfterInboundAreRelayed() {
     assert.deepEqual(seat2Events.slice(0, 2).map((entry) => entry.text), ["TWO", "EXTRA"]);
     assert.equal(seat2Events[0].hop, 1);
     assert.equal(seat2Events[1].hop, 1);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
+}
+
+async function testLateAttachedSessionSkipsHistoricalRelayReplay() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-late-replay-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-late-replay-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
+
+    seat1.write(
+      `MOCK_CODEX_SESSION_ID=late-replay-claim ` +
+      `MOCK_WRITE_SNAPSHOT_CLAIM=1 ` +
+      `MOCK_SESSION_STARTED_AT=${shellQuote("2026-03-09T12:00:00.000Z")} ` +
+      `MOCK_PRELOAD_REPLY=STALE ` +
+      `MOCK_PRELOAD_REPLY_AT=${shellQuote("2026-03-09T12:00:05.000Z")} ` +
+      `MOCK_REPLY_TEXT=FRESH ${process.execPath} ${shellQuote(fixturePath)} codex\r`
+    );
+    seat2.write(`MOCK_REPLY_MODE=mirror ${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+    await waitForStatus(home, cwd, /seat 1: running .*agent codex/i);
+    await waitForStatus(home, cwd, /seat 2: running .*agent gemini/i);
+
+    await sleep(900);
+    assert.doesNotMatch(seat2.getBuffer(), /\bSTALE\b/);
+    assert.deepEqual(readAnswerEvents(home, sessionName, 1).map((entry) => entry.text), []);
+    assert.deepEqual(readContinueEvents(home, sessionName, 2).map((entry) => entry.text), []);
+
+    seat1.write("go\r");
+
+    await seat1.waitFor(/\bFRESH\b/);
+    await seat2.waitFor(/\bFRESH\b/);
+    await sleep(900);
+
+    assert.deepEqual(readAnswerEvents(home, sessionName, 1).map((entry) => entry.text), ["FRESH"]);
+    assert.deepEqual(readContinueEvents(home, sessionName, 2).map((entry) => entry.text), ["FRESH"]);
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();
