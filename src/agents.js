@@ -716,10 +716,20 @@ function readGeminiCandidate(filePath) {
   }
 }
 
-function selectGeminiSessionFile(currentPath, processStartedAtMs, options = {}) {
+function rankGeminiCandidates(candidates) {
+  return candidates
+    .slice()
+    .sort((left, right) => (
+      (right.lastUpdatedMs || right.mtimeMs || 0) - (left.lastUpdatedMs || left.mtimeMs || 0) ||
+      (right.mtimeMs || 0) - (left.mtimeMs || 0) ||
+      (right.startedAtMs || 0) - (left.startedAtMs || 0) ||
+      left.path.localeCompare(right.path)
+    ));
+}
+
+function selectGeminiSessionFileFromRoots(currentPath, processStartedAtMs, roots, options = {}, fallbackMode = "strict") {
   const projectHash = createHash("sha256").update(currentPath).digest("hex");
-  const geminiRoots = getGeminiRoots(currentPath, options);
-  const liveCandidates = geminiRoots
+  const liveCandidates = roots
     .flatMap((rootPath) => readOpenSessionCandidates(options.pids ?? options.pid, rootPath, readGeminiCandidate))
     .filter((candidate) => candidate.projectHash === projectHash);
   const livePath = selectLiveSessionCandidatePath(liveCandidates, projectHash, options.captureSinceMs);
@@ -727,12 +737,39 @@ function selectGeminiSessionFile(currentPath, processStartedAtMs, options = {}) 
     return livePath;
   }
 
-  const candidates = geminiRoots
+  const candidates = roots
     .flatMap((rootPath) => walkFiles(rootPath, (filePath) => filePath.endsWith(".json")))
     .map((filePath) => readGeminiCandidate(filePath))
     .filter((candidate) => candidate !== null && candidate.projectHash === projectHash);
 
+  if (fallbackMode === "latest") {
+    return rankGeminiCandidates(candidates)[0]?.path || null;
+  }
+
   return selectSessionCandidatePath(candidates, projectHash, processStartedAtMs);
+}
+
+function selectGeminiSessionFile(currentPath, processStartedAtMs, options = {}) {
+  const geminiRoots = getGeminiRoots(currentPath, options);
+  const seatId = Number.parseInt(String(options.seatId || "").trim(), 10);
+
+  if (Number.isInteger(seatId) && seatId > 0 && geminiRoots.length > 0) {
+    const seatLocalPath = selectGeminiSessionFileFromRoots(
+      currentPath,
+      processStartedAtMs,
+      [geminiRoots[0]],
+      options,
+      "latest"
+    );
+    if (seatLocalPath) {
+      return seatLocalPath;
+    }
+  }
+
+  const fallbackRoots = Number.isInteger(seatId) && seatId > 0
+    ? geminiRoots.slice(1)
+    : geminiRoots;
+  return selectGeminiSessionFileFromRoots(currentPath, processStartedAtMs, fallbackRoots, options);
 }
 
 function parseGeminiMessage(message, options = {}) {

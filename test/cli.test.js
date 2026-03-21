@@ -51,6 +51,7 @@ async function main() {
   testChildEnvPreservesExplicitGeminiApiKey();
   testChildEnvIsolatesGeminiCliHomes();
   testGeminiSeatHomeSessionSelection();
+  testGeminiSeatHomeSelectionSurvivesDelayedFirstPrompt();
   await testCodexRelayUsesBracketedPaste();
   await testGeminiRelayUsesBracketedPaste();
   testTerminalInputFiltering();
@@ -608,6 +609,60 @@ function testGeminiSeatHomeSessionSelection() {
 
     assert.equal(seat2Selected, seat2File);
     assert.equal(seat3Selected, seat3File);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+function testGeminiSeatHomeSelectionSurvivesDelayedFirstPrompt() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-delay-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-delay-cwd-"));
+  const projectHash = createHash("sha256").update(cwd).digest("hex");
+  const processStartedAtMs = Date.parse("2026-03-20T19:00:00.000Z");
+
+  try {
+    const seat2Env = buildChildEnv(2, "demo-session", cwd, {
+      HOME: home,
+      PATH: "/usr/bin",
+    });
+
+    const seat2File = path.join(seat2Env.GEMINI_CLI_HOME, ".gemini", "tmp", "root", "chats", "session-seat2.json");
+    const staleGlobalFile = path.join(home, ".gemini", "tmp", "root", "chats", "session-global.json");
+
+    fs.mkdirSync(path.dirname(seat2File), { recursive: true });
+    fs.mkdirSync(path.dirname(staleGlobalFile), { recursive: true });
+
+    fs.writeFileSync(seat2File, JSON.stringify({
+      projectHash,
+      startTime: "2026-03-20T19:07:30.000Z",
+      lastUpdated: "2026-03-20T19:08:30.000Z",
+      messages: [],
+    }));
+    fs.writeFileSync(staleGlobalFile, JSON.stringify({
+      projectHash,
+      startTime: "2026-03-20T19:00:02.000Z",
+      lastUpdated: "2026-03-20T19:00:05.000Z",
+      messages: [],
+    }));
+
+    const selected = execFileSync(process.execPath, [
+      "-e",
+      `
+        const { selectGeminiSessionFile } = require(${JSON.stringify(path.join(__dirname, "..", "src", "agents.js"))});
+        const selected = selectGeminiSessionFile(
+          ${JSON.stringify(cwd)},
+          ${processStartedAtMs},
+          { seatId: 2 }
+        );
+        process.stdout.write(selected || "");
+      `,
+    ], {
+      encoding: "utf8",
+      env: buildEnv(home),
+    }).trim();
+
+    assert.equal(selected, seat2File);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(cwd, { recursive: true, force: true });
