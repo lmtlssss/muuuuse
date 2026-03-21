@@ -13,7 +13,11 @@ let lastTypedAtMs = 0;
 const MIN_SUBMIT_IDLE_MS = 30;
 
 process.stdin.on("data", (chunk) => {
-  for (const char of String(chunk || "")) {
+  const text = String(chunk || "")
+    .replace(/\u001b\[200~/g, "")
+    .replace(/\u001b\[201~/g, "");
+
+  for (const char of text) {
     if (char === "\u0003") {
       process.exit(0);
     }

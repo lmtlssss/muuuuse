@@ -51,6 +51,7 @@ async function main() {
   testChildEnvIsolatesGeminiCliHomes();
   testGeminiSeatHomeSessionSelection();
   await testCodexRelayUsesBracketedPaste();
+  await testGeminiRelayUsesBracketedPaste();
   testTerminalInputFiltering();
   testFragmentedPassiveTerminalInputFiltering();
   testRelayTypingChunks();
@@ -82,6 +83,7 @@ async function main() {
   await testDirectionalPartnerLinksSuppressReverseCommentary();
   await testLinkSyntaxFansOutAcrossTargets();
   await testGeminiReceiverNeedsCrSubmit();
+  await testGeminiLongRelaySubmitsWithBracketedPaste();
   await testStopSilencesBellLoop();
   await testStopPurgesSessionState();
   process.stdout.write("muuuuse tests passed\n");
@@ -573,6 +575,18 @@ async function testCodexRelayUsesBracketedPaste() {
 
   assert.equal(delivered, true);
   assert.deepEqual(writes, ["\u001b[200~FOLLOWUP-CODEX\u001b[201~", "\r"]);
+}
+
+async function testGeminiRelayUsesBracketedPaste() {
+  const writes = [];
+  const delivered = await sendTextAndEnter({
+    write(value) {
+      writes.push(value);
+    },
+  }, "FOLLOWUP GEMINI", { agentType: "gemini" });
+
+  assert.equal(delivered, true);
+  assert.deepEqual(writes, ["\u001b[200~FOLLOWUP GEMINI\u001b[201~", "\r"]);
 }
 
 function testTerminalInputFiltering() {
@@ -1405,7 +1419,7 @@ async function testEvenSeatCanStartBeforeOddSeat() {
     await seat1.waitFor(/seat 1 armed/i);
 
     seat1.write(`${shellQuote(noisyCodexPath)}\r`);
-    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)} gemini\r`);
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-submit-ready/);
@@ -1570,7 +1584,7 @@ async function testStandaloneLinksRouteWithoutPairDependency() {
     await seat3.waitFor(/seat 3 armed/i);
 
     seat2.write(`MOCK_REPLY_TEXT=SOLO_ROUTE ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
-    seat3.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+    seat3.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)} gemini\r`);
 
     await seat2.waitFor(/codex-ready/);
     await seat3.waitFor(/gemini-submit-ready/);
@@ -1598,7 +1612,7 @@ async function testDirectionalPartnerLinksOverrideReceiverFlow() {
     await seat2.waitFor(/seat 2 armed/i);
 
     seat1.write(`${shellQuote(noisyCodexPath)}\r`);
-    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)} gemini\r`);
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-submit-ready/);
@@ -1626,7 +1640,7 @@ async function testDirectionalPartnerLinksSuppressReverseCommentary() {
     await seat1.waitFor(/seat 1 armed/i);
     await seat2.waitFor(/seat 2 armed/i);
 
-    seat1.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+    seat1.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)} gemini\r`);
     seat2.write(`${shellQuote(noisyCodexPath)}\r`);
 
     await seat1.waitFor(/gemini-submit-ready/);
@@ -1667,9 +1681,9 @@ async function testLinkSyntaxFansOutAcrossTargets() {
     await seat6.waitFor(/seat 6 armed/i);
 
     seat1.write(`${shellQuote(noisyCodexPath)}\r`);
-    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
-    seat3.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
-    seat5.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)} gemini\r`);
+    seat3.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)} gemini\r`);
+    seat5.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)} gemini\r`);
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-submit-ready/);
@@ -1716,7 +1730,7 @@ async function testGeminiReceiverNeedsCrSubmit() {
     await seat2.waitFor(/seat 2 armed/i);
 
     seat1.write(`MOCK_REPLY_TEXT=SEND_ME ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
-    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)}\r`);
+    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)} gemini\r`);
 
     await seat1.waitFor(/codex-ready/);
     await seat2.waitFor(/gemini-submit-ready/);
@@ -1726,6 +1740,49 @@ async function testGeminiReceiverNeedsCrSubmit() {
 
     await seat1.waitFor(/SEND_ME/);
     await seat2.waitFor(/submitted:SEND_ME/);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
+}
+
+async function testGeminiLongRelaySubmitsWithBracketedPaste() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-long-submit-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-gemini-long-submit-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  const seat2 = spawnSeat(2, { cwd, home });
+  const longPayload = "LONG ".repeat(700).trim();
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
+
+    seat1.write(`MOCK_REPLY_TEXT=${shellQuote(longPayload)} ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`${process.execPath} ${shellQuote(geminiSubmitReceiverPath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-submit-ready/);
+    await waitForStatus(home, cwd, /seat 1: running .*links 2:off/i);
+
+    seat1.write("ignite\r");
+
+    await waitForCondition(
+      () => readAnswerEvents(home, sessionName, 1).some((entry) => entry.text === longPayload),
+      8000,
+      "long codex relay answer"
+    );
+    await waitForCondition(
+      () => readContinueEvents(home, sessionName, 2).some((entry) => entry.text === longPayload),
+      8000,
+      "long gemini continuation"
+    );
+    await waitForCondition(
+      () => seat2.getBuffer().includes("submitted:LONG LONG LONG"),
+      8000,
+      "gemini long relay submit"
+    );
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();

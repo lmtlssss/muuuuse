@@ -42,6 +42,7 @@ const {
 // A short settle delay keeps interactive CLIs from treating submit as another newline.
 const TYPE_CHUNK_DELAY_MS = 45;
 const TYPE_CHUNK_SIZE = 24;
+const GEMINI_PASTE_SETTLE_MS = 200;
 const BRACKETED_PASTE_START = "\u001b[200~";
 const BRACKETED_PASTE_END = "\u001b[201~";
 const GEMINI_SHARED_ENTRY_NAMES = new Set([
@@ -761,7 +762,7 @@ async function sendTextAndEnter(child, text, shouldAbort = () => false) {
   const payload = normalizeRelayPayloadForTyping(text);
 
   if (payload.length > 0) {
-    if (agentType === "codex") {
+    if (agentType === "codex" || agentType === "gemini") {
       if (shouldStop() || !child) {
         return false;
       }
@@ -770,6 +771,10 @@ async function sendTextAndEnter(child, text, shouldAbort = () => false) {
         child.write(`${BRACKETED_PASTE_START}${payload}${BRACKETED_PASTE_END}`);
       } catch {
         return false;
+      }
+
+      if (agentType === "gemini") {
+        await sleep(GEMINI_PASTE_SETTLE_MS);
       }
     } else {
       for (const chunk of chunkRelayPayloadForTyping(payload)) {
