@@ -43,6 +43,7 @@ async function main() {
   testCodexFlowParsing();
   testClaudeParsing();
   testGeminiParsing();
+  testGeminiParsingTracksRawMessageCursor();
   testLateAttachFiltering();
   testSessionCandidateSelection();
   testChildEnvScrubsOuterCodexState();
@@ -235,12 +236,60 @@ function testGeminiParsing() {
     ],
   }));
 
-  const parsed = readGeminiAnswers(tempFile, null);
+  const flowOff = readGeminiAnswers(tempFile, null, null, { flowMode: false });
+  const flowOn = readGeminiAnswers(tempFile, null, null, { flowMode: true });
   fs.rmSync(tempFile, { force: true });
 
-  assert.equal(parsed.answers.length, 1);
-  assert.equal(parsed.answers[0].id, "gm-2");
-  assert.equal(parsed.answers[0].text, "Final Gemini answer.");
+  assert.deepEqual(flowOff.answers.map((entry) => entry.id), ["gm-2"]);
+  assert.deepEqual(flowOn.answers.map((entry) => entry.id), ["gm-1", "gm-2"]);
+  assert.deepEqual(flowOn.answers.map((entry) => entry.phase), ["commentary", "final_answer"]);
+}
+
+function testGeminiParsingTracksRawMessageCursor() {
+  const tempFile = path.join(os.tmpdir(), `muuuuse-gemini-cursor-${Date.now()}.json`);
+  fs.writeFileSync(tempFile, JSON.stringify({
+    lastUpdated: "2026-03-09T12:03:00.000Z",
+    messages: [
+      {
+        id: "gm-1",
+        type: "gemini",
+        content: "Initial final-looking Gemini answer.",
+        toolCalls: [],
+        timestamp: "2026-03-09T12:01:00.000Z",
+      },
+    ],
+  }));
+
+  const firstPass = readGeminiAnswers(tempFile, null, null, { flowMode: false });
+  assert.deepEqual(firstPass.answers.map((entry) => entry.id), ["gm-1"]);
+  assert.equal(firstPass.lastMessageId, "gm-1");
+
+  fs.writeFileSync(tempFile, JSON.stringify({
+    lastUpdated: "2026-03-09T12:05:00.000Z",
+    messages: [
+      {
+        id: "gm-1",
+        type: "gemini",
+        content: "Actually still thinking.",
+        toolCalls: [{ id: "call-1" }],
+        timestamp: "2026-03-09T12:01:00.000Z",
+      },
+      {
+        id: "gm-2",
+        type: "gemini",
+        content: "Real later Gemini final.",
+        toolCalls: [],
+        timestamp: "2026-03-09T12:04:00.000Z",
+      },
+    ],
+  }));
+
+  const secondPass = readGeminiAnswers(tempFile, firstPass.lastMessageId, null, { flowMode: false });
+  fs.rmSync(tempFile, { force: true });
+
+  assert.deepEqual(secondPass.answers.map((entry) => entry.id), ["gm-2"]);
+  assert.deepEqual(secondPass.answers.map((entry) => entry.phase), ["final_answer"]);
+  assert.equal(secondPass.lastMessageId, "gm-2");
 }
 
 function testLateAttachFiltering() {

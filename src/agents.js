@@ -735,33 +735,56 @@ function selectGeminiSessionFile(currentPath, processStartedAtMs, options = {}) 
   return selectSessionCandidatePath(candidates, projectHash, processStartedAtMs);
 }
 
-function readGeminiAnswers(filePath, lastMessageId = null, sinceMs = null) {
+function parseGeminiMessage(message, options = {}) {
+  const flowMode = options.flowMode === true;
+  if (!message || message.type !== "gemini" || typeof message.content !== "string") {
+    return null;
+  }
+
+  const text = sanitizeRelayText(message.content);
+  if (!text) {
+    return null;
+  }
+
+  const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+  const phase = toolCalls.length > 0 ? "commentary" : "final_answer";
+  if (phase === "commentary" && !flowMode) {
+    return null;
+  }
+
+  return {
+    id: message.id || hashText(JSON.stringify(message)),
+    text,
+    phase,
+    timestamp: message.timestamp || new Date().toISOString(),
+  };
+}
+
+function readGeminiAnswers(filePath, lastMessageId = null, sinceMs = null, options = {}) {
   try {
     const entry = JSON.parse(fs.readFileSync(filePath, "utf8"));
     const messages = Array.isArray(entry.messages) ? entry.messages : [];
-    const finalMessages = messages.filter((message) => {
-      const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
-      return message.type === "gemini" && typeof message.content === "string" && message.content.trim() && toolCalls.length === 0;
-    });
 
     let startIndex = 0;
     if (lastMessageId) {
-      const previousIndex = finalMessages.findIndex((message) => message.id === lastMessageId);
-      startIndex = previousIndex === -1 ? finalMessages.length : previousIndex + 1;
+      const previousIndex = messages.findIndex((message) => message?.id === lastMessageId);
+      startIndex = previousIndex === -1 ? 0 : previousIndex + 1;
     }
 
-    const answers = finalMessages.slice(startIndex).map((message) => ({
-      id: message.id || hashText(JSON.stringify(message)),
-      text: sanitizeRelayText(message.content),
-      phase: "final_answer",
-      timestamp: message.timestamp || entry.lastUpdated || new Date().toISOString(),
-    }));
+    const answers = messages
+      .slice(startIndex)
+      .map((message) => parseGeminiMessage(message, options))
+      .filter((answer) => answer !== null);
+
+    const lastSeenMessage = [...messages]
+      .reverse()
+      .find((message) => typeof message?.id === "string" && message.id.trim());
 
     return {
       answers: answers
         .filter((answer) => answer.text.length > 0)
         .filter((answer) => isAnswerNewEnough(answer, sinceMs)),
-      lastMessageId: finalMessages.length > 0 ? finalMessages[finalMessages.length - 1].id : lastMessageId,
+      lastMessageId: lastSeenMessage?.id || lastMessageId,
       fileSize: getFileSize(filePath),
     };
   } catch {
