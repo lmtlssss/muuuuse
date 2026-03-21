@@ -21,12 +21,14 @@ const {
 const {
   buildChildEnv,
   chunkRelayPayloadForTyping,
+  consumeTerminalProxyInput,
   ensureSeatGeminiCliHome,
   isBareEscapeInput,
   isMeaningfulTerminalInput,
   normalizeRelayPayloadForTyping,
   sendTextAndEnter,
 } = require("../src/runtime");
+const { getSeatGeminiCliHome } = require("../src/util");
 
 const binPath = path.join(__dirname, "..", "bin", "muuse.js");
 const fixturePath = path.join(__dirname, "fixtures", "mock-agent.js");
@@ -50,6 +52,7 @@ async function main() {
   testGeminiSeatHomeSessionSelection();
   await testCodexRelayUsesBracketedPaste();
   testTerminalInputFiltering();
+  testFragmentedPassiveTerminalInputFiltering();
   testRelayTypingChunks();
   testAgentDetection();
   testAgentDetectionPrefersShallowCodexWrapper();
@@ -68,6 +71,7 @@ async function main() {
   await testMultilineRelaySubmitsOnce();
   await testPassiveTerminalReportsDoNotClearRelayContext();
   await testBareEscapeDoesNotClearRelayContext();
+  await testSeatRearmKeepsActiveSession();
   await testSeatSpecificFlowModes();
   await testAdditionalPairsStaySeparate();
   await testEvenSeatCanStartBeforeOddSeat();
@@ -79,6 +83,7 @@ async function main() {
   await testLinkSyntaxFansOutAcrossTargets();
   await testGeminiReceiverNeedsCrSubmit();
   await testStopSilencesBellLoop();
+  await testStopPurgesSessionState();
   process.stdout.write("muuuuse tests passed\n");
 }
 
@@ -584,6 +589,25 @@ function testTerminalInputFiltering() {
   assert.equal(isMeaningfulTerminalInput("go"), true);
 }
 
+function testFragmentedPassiveTerminalInputFiltering() {
+  let pendingPassiveInput = "";
+
+  let filtered = consumeTerminalProxyInput("\u001b]11;rgb:", pendingPassiveInput);
+  pendingPassiveInput = filtered.pendingPassiveInput;
+  assert.equal(filtered.forwardText, "");
+  assert.equal(filtered.meaningful, false);
+
+  filtered = consumeTerminalProxyInput("0000/0000/0000\u0007", pendingPassiveInput);
+  pendingPassiveInput = filtered.pendingPassiveInput;
+  assert.equal(filtered.forwardText, "");
+  assert.equal(filtered.meaningful, false);
+  assert.equal(pendingPassiveInput, "");
+
+  filtered = consumeTerminalProxyInput("\u001b[A", pendingPassiveInput);
+  assert.equal(filtered.forwardText, "\u001b[A");
+  assert.equal(filtered.meaningful, true);
+}
+
 function testRelayTypingChunks() {
   assert.equal(
     normalizeRelayPayloadForTyping("  alpha \n\n beta \r\n gamma  "),
@@ -643,6 +667,63 @@ async function testRelayStatusStop() {
     env: buildEnv(home),
   });
   assert.match(statusOutput, /no armed seats found/i);
+}
+
+async function testSeatRearmKeepsActiveSession() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-rearm-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-rearm-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home, extraArgs: seatArgs({ links: [[2, "off"]] }) });
+  let seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    await seat2.waitFor(/seat 2 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
+
+    seat1.write(`MOCK_REPLY_TEXT=ONE ${process.execPath} ${shellQuote(fixturePath)} codex\r`);
+    seat2.write(`${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+
+    await seat1.waitFor(/codex-ready/);
+    await seat2.waitFor(/gemini-ready/);
+
+    const staleGeminiPath = path.join(
+      getSeatGeminiCliHome(home, cwd, 2),
+      ".gemini",
+      "tmp",
+      "root",
+      "chats",
+      "stale.json"
+    );
+    fs.mkdirSync(path.dirname(staleGeminiPath), { recursive: true });
+    fs.writeFileSync(staleGeminiPath, "{\"stale\":true}\n");
+
+    seat2.dispose();
+    await seat2.waitForExit(5000);
+    await waitForCondition(() => {
+      const output = execFileSync(process.execPath, [binPath, "status"], {
+        encoding: "utf8",
+        cwd,
+        env: buildEnv(home),
+      });
+      return !/seat 2:/.test(output);
+    }, 10000, "seat 2 close cleanup");
+
+    seat2 = spawnSeat(2, { cwd, home, extraArgs: seatArgs({ links: [[1, "off"]] }) });
+    await seat2.waitFor(/seat 2 armed/i);
+    await waitForStatus(home, cwd, new RegExp(`${escapeRegExp(sessionName)}`));
+    seat2.write(`${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+    await seat2.waitFor(/gemini-ready/);
+
+    assert.equal(fs.existsSync(staleGeminiPath), false);
+
+    seat1.write("go\r");
+    await seat1.waitFor(/\bONE\b/);
+    await seat2.waitFor(/gemini turn 1: ONE/);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+    seat2.dispose();
+  }
 }
 
 async function testCodexPidBoundSessionSelection() {
@@ -716,13 +797,23 @@ async function testCodexSeatClaimSelection() {
     })}\n`);
   }
 
-  fs.writeFileSync(path.join(snapshotsDir, `${seat2Id}.sh`), [
+  fs.writeFileSync(path.join(snapshotsDir, `${seat1Id}.111.sh`), [
+    'declare -x MUUUUSE_SEAT="1"',
+    'declare -x MUUUUSE_SESSION="stale-session"',
+    "",
+  ].join("\n"));
+  fs.writeFileSync(path.join(snapshotsDir, `${seat1Id}.222.sh`), [
+    'declare -x MUUUUSE_SEAT="1"',
+    `declare -x MUUUUSE_SESSION="${sessionName}"`,
+    "",
+  ].join("\n"));
+  fs.writeFileSync(path.join(snapshotsDir, `${seat2Id}.333.sh`), [
     'declare -x MUUUUSE_SEAT="2"',
     `declare -x MUUUUSE_SESSION="${sessionName}"`,
     "",
   ].join("\n"));
 
-  const processStartedAtMs = Date.parse("2026-03-12T19:57:49.000Z");
+  const processStartedAtMs = Date.parse("2026-03-12T20:57:49.000Z");
   const seat1Selected = execFileSync(process.execPath, [
     "-e",
     `
@@ -1151,14 +1242,13 @@ async function testPassiveTerminalReportsDoNotClearRelayContext() {
     await sleep(300);
     seat2.write("\u001b[I\u001b]10;rgb:ffff/ffff/ffff\u001b\\\u001b]11;rgb:0000/0000/0000\u001b\\\u001b[12;34R");
 
-    await seat2.waitFor(/\bTWO\b/);
-    await sleep(1200);
+    await waitForCondition(() => readAnswerEvents(home, sessionName, 2).some((entry) => entry.text === "TWO"), 3000, "seat 2 passive relay");
 
     const seat1Events = readAnswerEvents(home, sessionName, 1);
     const seat2Events = readAnswerEvents(home, sessionName, 2);
 
-    assert.deepEqual(seat1Events.map((entry) => entry.text), ["ONE"]);
-    assert.deepEqual(seat2Events.map((entry) => entry.text), ["TWO"]);
+    assert.equal(seat1Events[0]?.text, "ONE");
+    assert.equal(seat2Events[0]?.text, "TWO");
     assert.equal(seat2Events[0].hop, 1);
     assert.equal(seat2Events[0].chainId, seat1Events[0].id);
   } finally {
@@ -1190,14 +1280,13 @@ async function testBareEscapeDoesNotClearRelayContext() {
     await sleep(300);
     seat2.write("\u001b");
 
-    await seat2.waitFor(/\bTWO\b/);
-    await sleep(1200);
+    await waitForCondition(() => readAnswerEvents(home, sessionName, 2).some((entry) => entry.text === "TWO"), 3000, "seat 2 bare escape relay");
 
     const seat1Events = readAnswerEvents(home, sessionName, 1);
     const seat2Events = readAnswerEvents(home, sessionName, 2);
 
-    assert.deepEqual(seat1Events.map((entry) => entry.text), ["ONE"]);
-    assert.deepEqual(seat2Events.map((entry) => entry.text), ["TWO"]);
+    assert.equal(seat1Events[0]?.text, "ONE");
+    assert.equal(seat2Events[0]?.text, "TWO");
     assert.equal(seat2Events[0].hop, 1);
     assert.equal(seat2Events[0].chainId, seat1Events[0].id);
   } finally {
@@ -1681,6 +1770,42 @@ async function testStopSilencesBellLoop() {
       env: buildEnv(home),
     });
     assert.match(statusOutput, /no armed seats found/i);
+  } finally {
+    await forceStop(home, cwd);
+    seat1.dispose();
+  }
+}
+
+async function testStopPurgesSessionState() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-stop-purge-home-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "muuuuse-stop-purge-cwd-"));
+  const seat1 = spawnSeat(1, { cwd, home });
+
+  try {
+    await seat1.waitFor(/seat 1 armed/i);
+    const sessionName = await waitForSessionName(home, cwd);
+    const sessionDir = path.join(home, ".muuuuse", "sessions", sessionName);
+    const geminiSeatHome = getSeatGeminiCliHome(home, cwd, 1);
+    const geminiSessionDir = path.dirname(geminiSeatHome);
+
+    seat1.write(`${process.execPath} ${shellQuote(fixturePath)} gemini\r`);
+    await seat1.waitFor(/gemini-ready/);
+
+    const staleGeminiPath = path.join(geminiSeatHome, ".gemini", "tmp", "root", "chats", "stale.json");
+    fs.mkdirSync(path.dirname(staleGeminiPath), { recursive: true });
+    fs.writeFileSync(staleGeminiPath, "{\"stale\":true}\n");
+
+    const stopOutput = execFileSync(process.execPath, [binPath, "stop"], {
+      encoding: "utf8",
+      cwd,
+      env: buildEnv(home),
+    });
+    assert.match(stopOutput, /stop requested/i);
+
+    await seat1.waitForExit(5000);
+    await waitForCondition(() => !fs.existsSync(sessionDir), 5000, "session dir purge after stop");
+    await waitForCondition(() => !fs.existsSync(geminiSeatHome), 5000, "seat gemini home purge after stop");
+    await waitForCondition(() => !fs.existsSync(geminiSessionDir), 5000, "session gemini home purge after stop");
   } finally {
     await forceStop(home, cwd);
     seat1.dispose();

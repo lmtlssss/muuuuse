@@ -56,8 +56,11 @@ const EMITTED_ANSWER_TTL_MS = 5 * 60 * 1000;
 const MAX_RECENT_INBOUND_RELAYS = 12;
 const MAX_RECENT_EMITTED_ANSWERS = 48;
 const STOP_FORCE_KILL_MS = 1200;
+const STOP_PURGE_WAIT_MS = STOP_FORCE_KILL_MS + 1200;
+const STOP_PURGE_POLL_MS = 60;
 const SEAT_JOIN_WAIT_MS = 3000;
 const SEAT_JOIN_POLL_MS = 60;
+const MAX_PENDING_PASSIVE_INPUT_CHARS = 512;
 const CHILD_ENV_DROP_KEYS = [
   "CODEX_CI",
   "CODEX_MANAGED_BY_NPM",
@@ -200,6 +203,7 @@ function ensureSeatGeminiCliHome(homeDir, cwd, seatId, baseEnv = process.env) {
   const sourceHomeRoot = String(baseEnv.GEMINI_CLI_HOME || homeDir).trim() || homeDir;
   const sourceGeminiDir = path.join(sourceHomeRoot, ".gemini");
   const targetHomeRoot = getSeatGeminiCliHome(homeDir, cwd, seatId);
+  fs.rmSync(targetHomeRoot, { recursive: true, force: true });
   const targetGeminiDir = ensureDir(path.join(targetHomeRoot, ".gemini"));
 
   let sourceEntries = [];
@@ -653,6 +657,103 @@ function isMeaningfulTerminalInput(input) {
   return stripPassiveTerminalInput(input).length > 0;
 }
 
+function consumeTerminalProxyInput(input, pendingPassiveInput = "") {
+  const combined = `${pendingPassiveInput}${String(input || "")}`;
+  let forwardText = "";
+  let index = 0;
+
+  while (index < combined.length) {
+    const current = combined[index];
+    if (current !== "\u001b") {
+      forwardText += current;
+      index += 1;
+      continue;
+    }
+
+    if (index + 1 >= combined.length) {
+      forwardText += current;
+      index += 1;
+      continue;
+    }
+
+    const next = combined[index + 1];
+    if (next === "]") {
+      const belIndex = combined.indexOf("\u0007", index + 2);
+      const stIndex = combined.indexOf("\u001b\\", index + 2);
+      const endIndex = (
+        belIndex !== -1 && stIndex !== -1 ? Math.min(belIndex, stIndex) :
+        belIndex !== -1 ? belIndex :
+        stIndex
+      );
+
+      if (endIndex === -1) {
+        const pending = combined.slice(index).slice(0, MAX_PENDING_PASSIVE_INPUT_CHARS);
+        return {
+          forwardText,
+          meaningful: isMeaningfulTerminalInput(forwardText),
+          pendingPassiveInput: pending,
+        };
+      }
+
+      index = endIndex + (endIndex === stIndex ? 2 : 1);
+      continue;
+    }
+
+    if (next === "[") {
+      if (index + 2 >= combined.length) {
+        return {
+          forwardText,
+          meaningful: isMeaningfulTerminalInput(forwardText),
+          pendingPassiveInput: combined.slice(index).slice(0, MAX_PENDING_PASSIVE_INPUT_CHARS),
+        };
+      }
+
+      let endIndex = index + 2;
+      while (endIndex < combined.length && !/[@-~]/.test(combined[endIndex])) {
+        endIndex += 1;
+      }
+
+      if (endIndex >= combined.length) {
+        const pending = combined.slice(index);
+        if (/^\u001b\[(?:\??[0-9;]*)?$/.test(pending)) {
+          return {
+            forwardText,
+            meaningful: isMeaningfulTerminalInput(forwardText),
+            pendingPassiveInput: pending.slice(0, MAX_PENDING_PASSIVE_INPUT_CHARS),
+          };
+        }
+
+        forwardText += pending;
+        break;
+      }
+
+      const sequence = combined.slice(index, endIndex + 1);
+      if (
+        sequence === "\u001b[I" ||
+        sequence === "\u001b[O" ||
+        /^\u001b\[\d+;\d+R$/.test(sequence) ||
+        /^\u001b\[\?[0-9;]*c$/.test(sequence)
+      ) {
+        index = endIndex + 1;
+        continue;
+      }
+
+      forwardText += sequence;
+      index = endIndex + 1;
+      continue;
+    }
+
+    forwardText += current;
+    index += 1;
+  }
+
+  return {
+    forwardText,
+    meaningful: isMeaningfulTerminalInput(forwardText),
+    pendingPassiveInput: "",
+  };
+}
+
 async function sendTextAndEnter(child, text, shouldAbort = () => false) {
   const options = typeof shouldAbort === "function" ? { shouldAbort } : (shouldAbort || {});
   const shouldStop = typeof options.shouldAbort === "function" ? options.shouldAbort : () => false;
@@ -730,6 +831,7 @@ class ArmedSeat {
     this.forceKillTimer = null;
     this.identity = loadOrCreateSeatIdentity(this.paths);
     this.lastUserInputAtMs = 0;
+    this.pendingPassiveInput = "";
     this.pendingInboundContext = null;
     this.recentInboundRelays = [];
     this.recentEmittedAnswers = [];
@@ -843,14 +945,16 @@ class ArmedSeat {
   installStdinProxy() {
     const handleData = (chunk) => {
       const chunkText = chunk.toString("utf8");
-      if (isMeaningfulTerminalInput(chunkText)) {
+      const proxyInput = consumeTerminalProxyInput(chunkText, this.pendingPassiveInput);
+      this.pendingPassiveInput = proxyInput.pendingPassiveInput;
+      if (proxyInput.meaningful) {
         this.lastUserInputAtMs = Date.now();
         this.pendingInboundContext = null;
       }
-      if (!this.child) {
+      if (!this.child || proxyInput.forwardText.length === 0) {
         return;
       }
-      this.child.write(chunkText);
+      this.child.write(proxyInput.forwardText);
     };
 
     const handleEnd = () => {
@@ -1537,6 +1641,8 @@ class ArmedSeat {
       exitedAt: new Date().toISOString(),
       state: "exited",
     });
+
+    purgeSeatTransientState(this.sessionPaths.dir, this.paths.dir, this.cwd, this.seatId);
   }
 }
 
@@ -1661,6 +1767,10 @@ function stopAllSessions() {
     }
   }
 
+  for (const session of report.sessions) {
+    finalizeStoppedSession(session);
+  }
+
   return {
     requestedAt,
     sessions: report.sessions,
@@ -1670,6 +1780,7 @@ function stopAllSessions() {
 module.exports = {
   ArmedSeat,
   buildChildEnv,
+  consumeTerminalProxyInput,
   ensureSeatGeminiCliHome,
   chunkRelayPayloadForTyping,
   getStatusReport,
@@ -1691,6 +1802,77 @@ function signalPid(pid, signal) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function finalizeStoppedSession(session, timeoutMs = STOP_PURGE_WAIT_MS) {
+  if (!session || !Array.isArray(session.seats) || session.seats.length === 0) {
+    return;
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const pendingSeats = session.seats.filter((seat) => isPidAlive(seat.wrapperPid) || isPidAlive(seat.childPid));
+    if (pendingSeats.length === 0) {
+      break;
+    }
+    sleepSync(STOP_PURGE_POLL_MS);
+  }
+
+  for (const seat of session.seats) {
+    if (isPidAlive(seat.childPid)) {
+      signalProcessFamily(seat.childPid, "SIGKILL");
+    }
+    if (isPidAlive(seat.wrapperPid)) {
+      signalPid(seat.wrapperPid, "SIGKILL");
+    }
+  }
+
+  sleepSync(STOP_PURGE_POLL_MS);
+
+  const sessionDir = getSessionPaths(session.sessionName).dir;
+  for (const seat of session.seats) {
+    purgeSeatTransientState(sessionDir, getSeatPaths(session.sessionName, seat.seatId).dir, seat.cwd, seat.seatId);
+  }
+}
+
+function purgeSeatTransientState(sessionDir, seatDir, cwd, seatId) {
+  let geminiSessionDir = null;
+  try {
+    fs.rmSync(seatDir, { recursive: true, force: true });
+  } catch {
+    // Best effort only.
+  }
+
+  try {
+    const homeDir = String(process.env.HOME || "").trim() || "/root";
+    const geminiSeatHome = getSeatGeminiCliHome(homeDir, cwd, seatId);
+    geminiSessionDir = path.dirname(geminiSeatHome);
+    fs.rmSync(geminiSeatHome, { recursive: true, force: true });
+  } catch {
+    // Best effort only.
+  }
+
+  if (geminiSessionDir) {
+    try {
+      const remainingGeminiSeatDirs = fs.readdirSync(geminiSessionDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && /^seat-\d+$/.test(entry.name));
+      if (remainingGeminiSeatDirs.length === 0) {
+        fs.rmSync(geminiSessionDir, { recursive: true, force: true });
+      }
+    } catch {
+      // Best effort only.
+    }
+  }
+
+  try {
+    const remainingSeatDirs = fs.readdirSync(sessionDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^seat-\d+$/.test(entry.name));
+    if (remainingSeatDirs.length === 0) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  } catch {
+    // Best effort only.
   }
 }
 

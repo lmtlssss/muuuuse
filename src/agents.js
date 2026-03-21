@@ -179,22 +179,73 @@ function readCodexSeatClaim(sessionId) {
     return null;
   }
 
-  const snapshotPath = path.join(CODEX_SNAPSHOT_ROOT, `${sessionId}.sh`);
-  try {
-    const text = fs.readFileSync(snapshotPath, "utf8");
-    const seatMatch = text.match(/declare -x MUUUUSE_SEAT="([^"]+)"/);
-    const sessionMatch = text.match(/declare -x MUUUUSE_SESSION="([^"]+)"/);
-    if (!seatMatch || !sessionMatch) {
-      return null;
-    }
+  const claims = readCodexSeatClaims(sessionId);
+  return claims[0] || null;
+}
 
-    return {
-      seatId: seatMatch[1],
-      sessionName: sessionMatch[1],
-    };
-  } catch {
-    return null;
+function readCodexSeatClaims(sessionId) {
+  if (!sessionId) {
+    return [];
   }
+
+  const candidatePaths = listCodexSnapshotPaths(sessionId);
+  return candidatePaths
+    .map((snapshotPath) => {
+      let text;
+      try {
+        text = fs.readFileSync(snapshotPath, "utf8");
+      } catch {
+        return null;
+      }
+
+      const seatMatch = text.match(/declare -x MUUUUSE_SEAT="([^"]+)"/);
+      const sessionMatch = text.match(/declare -x MUUUUSE_SESSION="([^"]+)"/);
+      if (!seatMatch || !sessionMatch) {
+        return null;
+      }
+
+      let mtimeMs = 0;
+      try {
+        mtimeMs = fs.statSync(snapshotPath).mtimeMs;
+      } catch {
+        // Best effort only.
+      }
+
+      return {
+        seatId: seatMatch[1],
+        sessionName: sessionMatch[1],
+        snapshotPath,
+        mtimeMs,
+      };
+    })
+    .filter((claim) => claim !== null)
+    .sort((left, right) => right.mtimeMs - left.mtimeMs || left.snapshotPath.localeCompare(right.snapshotPath));
+}
+
+function listCodexSnapshotPaths(sessionId) {
+  const exactName = `${sessionId}.sh`;
+  const prefix = `${sessionId}.`;
+  const candidateNames = [];
+
+  try {
+    for (const entry of fs.readdirSync(CODEX_SNAPSHOT_ROOT, { withFileTypes: true })) {
+      if (!entry.isFile()) {
+        continue;
+      }
+
+      if (entry.name === exactName || (entry.name.startsWith(prefix) && entry.name.endsWith(".sh"))) {
+        candidateNames.push(entry.name);
+      }
+    }
+  } catch {
+    // Snapshot directory may not exist yet.
+  }
+
+  return uniquePaths(candidateNames.map((name) => path.join(CODEX_SNAPSHOT_ROOT, name)));
+}
+
+function candidateHasClaim(candidate, predicate) {
+  return readCodexSeatClaims(candidate.sessionId).some((claim) => predicate(claim));
 }
 
 function selectClaimedCodexCandidatePath(candidates, options = {}) {
@@ -204,29 +255,28 @@ function selectClaimedCodexCandidatePath(candidates, options = {}) {
     return null;
   }
 
-  const annotated = candidates.map((candidate) => ({
-    ...candidate,
-    claim: readCodexSeatClaim(candidate.sessionId),
-  }));
-
-  const exactMatches = annotated.filter((candidate) => (
-    candidate.claim?.seatId === seatId &&
-    candidate.claim?.sessionName === sessionName
+  const exactMatches = candidates.filter((candidate) => (
+    candidateHasClaim(candidate, (claim) => (
+      claim.seatId === seatId &&
+      claim.sessionName === sessionName
+    ))
   ));
   if (exactMatches.length === 1) {
     return exactMatches[0].path;
   }
 
-  const otherSeatClaims = annotated.filter((candidate) => (
-    candidate.claim?.sessionName === sessionName &&
-    candidate.claim?.seatId !== seatId
+  const otherSeatClaims = candidates.filter((candidate) => (
+    candidateHasClaim(candidate, (claim) => (
+      claim.sessionName === sessionName &&
+      claim.seatId !== seatId
+    ))
   ));
   if (otherSeatClaims.length === 0) {
     return null;
   }
 
   const foreignPaths = new Set(otherSeatClaims.map((candidate) => candidate.path));
-  const remaining = annotated.filter((candidate) => !foreignPaths.has(candidate.path));
+  const remaining = candidates.filter((candidate) => !foreignPaths.has(candidate.path));
   if (remaining.length === 1) {
     return remaining[0].path;
   }
@@ -332,8 +382,10 @@ function selectExactClaimedCodexCandidate(candidates, options = {}, processStart
 
   const exactMatches = rankCodexCandidates(
     candidates.filter((candidate) => {
-      const claim = readCodexSeatClaim(candidate.sessionId);
-      return claim?.seatId === seatId && claim?.sessionName === sessionName;
+      return candidateHasClaim(candidate, (claim) => (
+        claim.seatId === seatId &&
+        claim.sessionName === sessionName
+      ));
     }),
     processStartedAtMs
   );
@@ -349,8 +401,11 @@ function filterForeignClaimedCodexCandidates(candidates, options = {}) {
   }
 
   return candidates.filter((candidate) => {
-    const claim = readCodexSeatClaim(candidate.sessionId);
-    return !(claim?.sessionName === sessionName && claim?.seatId && claim.seatId !== seatId);
+    return !candidateHasClaim(candidate, (claim) => (
+      claim.sessionName === sessionName &&
+      claim.seatId &&
+      claim.seatId !== seatId
+    ));
   });
 }
 
@@ -391,8 +446,11 @@ function selectCodexCandidatePath(candidates, currentPath, processStartedAtMs, o
     seatId &&
     sessionName &&
     cwdMatches.some((candidate) => {
-      const claim = readCodexSeatClaim(candidate.sessionId);
-      return claim?.sessionName === sessionName && claim?.seatId && claim.seatId !== seatId;
+      return candidateHasClaim(candidate, (claim) => (
+        claim.sessionName === sessionName &&
+        claim.seatId &&
+        claim.seatId !== seatId
+      ));
     })
   );
   const allowedMatches = filterForeignClaimedCodexCandidates(cwdMatches, options);
